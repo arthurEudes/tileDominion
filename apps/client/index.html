@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"
+    />
+    <title>Tile Dominion</title>
+  </head>
+  <body>
+    <div id="menu">
+      <div class="card">
+        <div class="logo">TILE<br /><span>DOMINION</span></div>
+        <p>Conquiers la grille. Construis ton armée. Garde ton royaume.</p>
+        <input id="name" maxlength="16" placeholder="Ton pseudonyme" /><button
+          id="play"
+        >
+          JOUER EN INVITÉ</button
+        ><small>WASD / ZQSD / flèches · Espace pour attaquer</small>
+      </div>
+    </div>
+    <div id="hud" hidden>
+      <div class="stats">
+        <b id="money">◈ 0</b><b id="hp">♥ 100</b><b id="tiles">▦ 0</b
+        ><b id="globalUnits">♟ 0</b><b id="time">10:00</b><i id="connection">●</i>
+      </div>
+      <div id="leader"></div>
+      <button id="shopToggle">BOUTIQUE</button>
+      <div id="shop" hidden>
+        <h3>UNITÉS</h3>
+        <div class="shop-grid">
+          <button data-buy="robot"><b>Robot</b><span>Capture autonome</span><em>◈90</em></button>
+          <button data-buy="attacker"><b>Attaquant</b><span>Verrouille et poursuit sa cible</span><em>◈140</em></button>
+          <button data-buy="defender"><b>Défenseur</b><span>Garde sa zone · 210 PV · 18 dégâts</span><em>◈220</em></button>
+        </div>
+        <h3>BASTIONS</h3>
+        <div class="shop-grid">
+          <button data-build="fortress"><b>Forteresse</b><span>Produit des défenseurs</span><em>◈480</em></button>
+          <button data-build="factory"><b>Usine</b><span>Produit des robots</span><em>◈480</em></button>
+          <button data-build="relay"><b>Relais</b><span>Ravitaille une enclave</span><em>◈480</em></button>
+          <button data-build="wall"><b>Mur</b><span>Bloque alliés et ennemis · 750 PV</span><em>◈90</em></button>
+          <button data-build="turret"><b>Tourelle</b><span>Tire automatiquement à portée</span><em>◈420</em></button>
+        </div>
+        <h3>AMÉLIORATIONS</h3>
+        <div class="shop-grid upgrades">
+          <button data-buy="speed"><b>Vitesse</b><em>◈110+</em></button>
+          <button data-buy="armor"><b>Armure</b><em>◈110+</em></button>
+          <button data-buy="capture"><b>Capture</b><em>◈120+</em></button>
+        </div>
+      </div>
+      <div id="orders">
+        <b id="selectionCount">0 attaquant</b>
+        <button data-order="follow">Suivre</button>
+        <button data-order="guard">Garder une zone</button>
+        <button data-order="attack">Attaquer une zone</button>
+        <span id="mode"></span>
+      </div>
+      <div id="stick"><div></div></div>
+      <button id="attack">⚔</button>
+    </div>
+    <div id="game"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

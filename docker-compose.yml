@@ -1,0 +1,17 @@
+services:
+  server:
+    build: .
+    environment: [PORT=2567, CLIENT_URL=http://localhost:5173, STORAGE_DRIVER=memory]
+    ports: ["2567:2567"]
+  client:
+    build: .
+    command: npm run preview -w @tile/client -- --port 5173
+    environment: [VITE_SERVER_URL=http://localhost:2567]
+    ports: ["5173:5173"]
+    depends_on: [server]
+  postgres:
+    image: postgres:17-alpine
+    profiles: [persistent]
+    environment: [POSTGRES_USER=tile, POSTGRES_PASSWORD=tile, POSTGRES_DB=tile_dominion]
+    volumes: [tile_data:/var/lib/postgresql/data]
+volumes: {tile_data: {}}

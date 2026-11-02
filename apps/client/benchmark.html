@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tile Dominion — benchmark renderer</title>
+    <style>
+      html, body, #benchmark { margin: 0; width: 100%; height: 100%; background: #08131f; color: #e9f6ff; }
+      #results { position: fixed; inset: 8px auto auto 8px; z-index: 2; margin: 0; padding: 10px; background: #08131fdd; font: 13px monospace; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <pre id="results" aria-live="polite">Initialisation…</pre>
+    <div id="benchmark"></div>
+    <script type="module" src="/src/benchmark-renderer.ts"></script>
+  </body>
+</html>

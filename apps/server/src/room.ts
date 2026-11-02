@@ -1,0 +1,671 @@
+import { Room, Client } from "colyseus";
+import { COLORS, GAME } from "@tile/game-config";
+import {
+  BuySchema,
+  BuildSchema,
+  InputSchema,
+  JoinSchema,
+  OrderSchema,
+  compactSnapshot,
+  POSITION_SCALE,
+  type CompactUnitDelta,
+  type ServerUnitView,
+  type Snapshot,
+} from "@tile/protocol";
+import { World } from "./world.js";
+import { RustEngine } from "./rust-engine.js";
+import { key, type Player, type Unit } from "./model.js";
+
+type BotForces = {
+  robots: Unit[];
+  attackers: Unit[];
+  defenders: Unit[];
+  headquarters?: Unit;
+  fortresses: Unit[];
+  factories: Unit[];
+  relays: Unit[];
+  walls: Unit[];
+  turrets: Unit[];
+};
+
+export class DominionRoom extends Room {
+  maxClients = GAME.room.maxPlayers;
+  world = new World();
+  rust = new RustEngine();
+  simulationBusy = false;
+  elapsed = 0;
+  rates = new Map<string, { at: number; n: number }>();
+  botThink = new Map<string, number>();
+  botBuildThink = new Map<string, number>();
+  botSerial = 0;
+  unitChannels = new Map<
+    string,
+    {
+      nextId: number;
+      ids: Map<string, number>;
+      previous: Map<string, [number, number, number, number]>;
+    }
+  >();
+  onCreate() {
+    for (let i = 0; i < GAME.bots.count; i++) this.addBot();
+    this.setSimulationInterval(
+      (dt) => void this.step(dt / 1000),
+      1000 / GAME.room.tickRate,
+    );
+    this.onMessage("ready", (c) =>
+      c.send("state", this.wireSnapshot(c.sessionId, true)),
+    );
+    this.onMessage("input", (c, m) => {
+      if (!this.allow(c)) return;
+      const v = InputSchema.safeParse(m);
+      if (v.success) this.world.setInput(c.sessionId, v.data);
+    });
+    this.onMessage("buy", (c, m) => {
+      const v = BuySchema.safeParse(m);
+      if (!v.success) return;
+      const item = v.data.item,
+        p = this.world.players.get(c.sessionId),
+        before = p?.money ?? 0,
+        ok = this.world.buy(c.sessionId, item),
+        counts = this.world.counts(c.sessionId);
+      let message = ok ? "Achat confirmé" : "Achat refusé";
+      if (
+        !ok &&
+        (item === "robot" ||
+          item === "soldier" ||
+          item === "attacker" ||
+          item === "defender")
+      ) {
+        const cfg = GAME.units[item];
+        message =
+          counts[item === "robot" ? "robots" : "soldiers"] >= cfg.max
+            ? `Limite de ${cfg.max} ${item}s atteinte`
+            : before < cfg.price
+              ? `Il faut ${cfg.price} crédits`
+              : message;
+      } else if (!ok && p) {
+        const cfg = GAME.upgrades[item as keyof typeof GAME.upgrades],
+          level = p.upgrades[item as keyof typeof p.upgrades];
+        message =
+          level >= cfg.max ? "Niveau maximum atteint" : "Fonds insuffisants";
+      }
+      c.send("purchase", {
+        ok,
+        item,
+        money: p?.money ?? 0,
+        message,
+        ...counts,
+      });
+      if (p) c.send("state", this.wireSnapshot(c.sessionId));
+    });
+    this.onMessage("build", (c, m) => {
+      if (!this.allow(c)) return;
+      const v = BuildSchema.safeParse(m);
+      if (!v.success) return;
+      const buildPrice =
+          v.data.kind === "wall"
+            ? GAME.units.bastion.wallPrice
+            : v.data.kind === "turret"
+              ? GAME.units.bastion.turretPrice
+              : GAME.units.bastion.price,
+        ok = this.world.placeBastion(
+          c.sessionId,
+          v.data.x,
+          v.data.y,
+          v.data.kind,
+        ),
+        p = this.world.players.get(c.sessionId),
+        counts = this.world.counts(c.sessionId);
+      c.send("purchase", {
+        ok,
+        item: v.data.kind,
+        money: p?.money ?? 0,
+        message: ok
+          ? `${v.data.kind === "fortress" ? "Forteresse" : v.data.kind === "factory" ? "Usine" : v.data.kind === "relay" ? "Relais" : v.data.kind === "wall" ? "Mur" : "Tourelle"} construit`
+          : `Placement impossible (territoire, distance ou ${buildPrice} crédits)`,
+        ...counts,
+      });
+    });
+    this.onMessage("order", (c, m) => {
+      if (!this.allow(c)) return;
+      const v = OrderSchema.safeParse(m);
+      if (!v.success) return;
+      const changed = this.world.orderSoldiers(c.sessionId, v.data);
+      c.send("orderResult", {
+        ok: changed > 0,
+        message: changed
+          ? `Ordre transmis à ${changed} soldat(s)`
+          : "Aucun soldat valide sélectionné",
+      });
+    });
+  }
+  onJoin(c: Client, opts: unknown) {
+    const v = JoinSchema.safeParse(opts);
+    this.evictBotForHuman();
+    this.world.addPlayer(
+      c.sessionId,
+      v.success ? v.data.name : `Invité-${c.sessionId.slice(0, 4)}`,
+      COLORS[this.clients.length % COLORS.length],
+    );
+    this.rust.invalidateMap();
+    c.send("welcome", { id: c.sessionId });
+  }
+  async onLeave(c: Client, consented: boolean) {
+    if (consented) {
+      this.replaceHumanWithBot(c.sessionId);
+      this.cleanupClient(c.sessionId);
+      return;
+    }
+    try {
+      await this.allowReconnection(c, GAME.room.reconnectSeconds);
+    } catch {
+      this.replaceHumanWithBot(c.sessionId);
+      this.cleanupClient(c.sessionId);
+    }
+  }
+  onDispose() {
+    this.rust.close();
+  }
+  allow(c: Client) {
+    const now = Date.now(),
+      r = this.rates.get(c.sessionId) ?? { at: now, n: 0 };
+    if (now - r.at > 1000) {
+      r.at = now;
+      r.n = 0;
+    }
+    r.n++;
+    this.rates.set(c.sessionId, r);
+    return r.n <= 35;
+  }
+  async step(dt: number) {
+    if (this.simulationBusy) return;
+    this.simulationBusy = true;
+    const now = Date.now();
+    try {
+      this.updateBots(now);
+      await this.world.tickWithRust(this.rust, Math.min(dt, 0.1), now);
+      this.elapsed += dt;
+      if (this.elapsed >= 0.1) {
+        this.elapsed = 0;
+        const changed = [...this.world.dirtyTiles],
+          counts = this.world.allCounts();
+        for (const c of this.clients)
+          c.send(
+            "state",
+            this.wireSnapshot(c.sessionId, false, changed, counts),
+          );
+        this.world.dirtyTiles.clear();
+      }
+    } catch (error) {
+      console.error(
+        "Moteur Rust indisponible, tick TypeScript de secours",
+        error,
+      );
+      this.world.tick(Math.min(dt, 0.1), now);
+    } finally {
+      this.simulationBusy = false;
+    }
+  }
+  updateBots(now: number) {
+    const due = [...this.world.players.values()].filter(
+      (p) =>
+        p.isBot && p.alive && now >= (this.botThink.get(p.id) ?? 0),
+    );
+    if (!due.length) return;
+    const forces = new Map<string, BotForces>();
+    for (const p of due)
+      forces.set(p.id, {
+        robots: [],
+        attackers: [],
+        defenders: [],
+        fortresses: [],
+        factories: [],
+        relays: [],
+        walls: [],
+        turrets: [],
+      });
+    const structures: Unit[] = [];
+    for (const unit of this.world.units.values()) {
+      if (unit.kind === "headquarters" || unit.kind === "bastion")
+        structures.push(unit);
+      const army = forces.get(unit.ownerId);
+      if (!army) continue;
+      if (unit.kind === "robot") army.robots.push(unit);
+      else if (unit.kind === "defender") army.defenders.push(unit);
+      else if (unit.kind === "soldier" || unit.kind === "attacker")
+        army.attackers.push(unit);
+      else if (unit.kind === "headquarters") army.headquarters = unit;
+      else if (unit.bastionType === "factory") army.factories.push(unit);
+      else if (unit.bastionType === "relay") army.relays.push(unit);
+      else if (unit.bastionType === "wall") army.walls.push(unit);
+      else if (unit.bastionType === "turret") army.turrets.push(unit);
+      else army.fortresses.push(unit);
+    }
+    for (const p of due) {
+      this.botThink.set(
+        p.id,
+        now + GAME.bots.thinkIntervalMs + Math.random() * 400,
+      );
+      const army = forces.get(p.id)!;
+      const threatened = this.findBotThreat(p, army.headquarters);
+      const strategicTarget = this.findEnemyStructure(p, structures);
+      const target = threatened
+        ? { x: threatened.x, y: threatened.y }
+        : strategicTarget
+          ? { x: strategicTarget.x, y: strategicTarget.y }
+          : this.world.findCaptureTarget(p);
+      const a = target
+        ? Math.atan2(target.y - p.y, target.x - p.x)
+        : Math.random() * Math.PI * 2;
+      p.input = {
+        x: Math.cos(a),
+        y: Math.sin(a),
+        attack: true,
+        seq: p.input.seq + 1,
+      };
+      if (strategicTarget && army.attackers.length)
+        this.world.orderSoldiers(p.id, {
+          unitIds: army.attackers.slice(0, 100).map((unit) => unit.id),
+          mode: "attack",
+          x: strategicTarget.x,
+          y: strategicTarget.y,
+        });
+      if (now >= (this.botBuildThink.get(p.id) ?? 0)) {
+        this.botBuildThink.set(
+          p.id,
+          now + GAME.bots.buildThinkIntervalMs + Math.random() * 1000,
+        );
+        this.planBotBuilding(p, army, !!threatened, now);
+      }
+      this.planBotPurchase(p, army, !!threatened);
+    }
+  }
+  addBot() {
+    const serial = ++this.botSerial,
+      id = `bot-${serial}`;
+    this.world.addPlayer(
+      id,
+      `IA ${serial}`,
+      COLORS[(serial + 2) % COLORS.length],
+      true,
+    );
+    this.botThink.set(id, 0);
+    this.botBuildThink.set(id, 0);
+    return id;
+  }
+  evictBotForHuman() {
+    const bots = [...this.world.players.values()].filter((p) => p.isBot);
+    if (!bots.length) return false;
+    const victim = bots.reduce((weakest, candidate) =>
+      this.botStrength(candidate.id) < this.botStrength(weakest.id)
+        ? candidate
+        : weakest,
+    );
+    const neutralized = this.world.neutralizePlayer(victim.id);
+    this.botThink.delete(victim.id);
+    this.botBuildThink.delete(victim.id);
+    for (const channel of this.unitChannels.values())
+      for (const unitId of neutralized) channel.previous.delete(unitId);
+    return true;
+  }
+  replaceHumanWithBot(id: string) {
+    const serial = ++this.botSerial;
+    if (!this.world.convertPlayerToBot(id, `IA ${serial}`)) return false;
+    this.botThink.set(id, 0);
+    this.botBuildThink.set(id, 0);
+    return true;
+  }
+  private cleanupClient(id: string) {
+    this.unitChannels.delete(id);
+    this.rates.delete(id);
+  }
+  private botStrength(id: string) {
+    let units = 0,
+      structures = 0;
+    for (const unit of this.world.units.values())
+      if (unit.ownerId === id) {
+        units++;
+        if (unit.kind === "headquarters" || unit.kind === "bastion")
+          structures++;
+      }
+    return (this.world.territoryCounts.get(id) ?? 0) * 2 + units + structures * 8;
+  }
+  private findBotThreat(p: Player, headquarters?: Unit) {
+    const origin = headquarters ?? p,
+      radius = 12;
+    let nearest: Player | Unit | undefined,
+      best = Number.POSITIVE_INFINITY;
+    for (const entity of this.world.spatial.query(origin.x, origin.y, radius)) {
+      const enemy =
+        entity.id !== p.id &&
+        ("kind" in entity ? entity.ownerId !== p.id : entity.id !== p.id);
+      if (!enemy) continue;
+      const distance = Math.hypot(entity.x - origin.x, entity.y - origin.y);
+      if (distance < best) {
+        nearest = entity;
+        best = distance;
+      }
+    }
+    return nearest;
+  }
+  private findEnemyStructure(p: Player, structures: Unit[]) {
+    let nearest: Unit | undefined,
+      best = GAME.bots.structureAttackRadius ** 2;
+    for (const structure of structures) {
+      if (structure.ownerId === p.id) continue;
+      const dx = structure.x - p.x,
+        dy = structure.y - p.y,
+        distanceSquared = dx * dx + dy * dy;
+      if (distanceSquared < best) {
+        nearest = structure;
+        best = distanceSquared;
+      }
+    }
+    return nearest;
+  }
+  private planBotPurchase(p: Player, army: BotForces, threatened: boolean) {
+    const tiles = this.world.territoryCounts.get(p.id) ?? 0,
+      robotGoal = Math.min(30, 6 + Math.floor(tiles / 20)),
+      defenderGoal = 2 + army.fortresses.length * 3 + (threatened ? 4 : 0),
+      attackerGoal = Math.min(40, 6 + Math.floor(tiles / 12));
+    if (
+      threatened &&
+      army.defenders.length < defenderGoal &&
+      p.money >= GAME.units.defender.price
+    )
+      this.world.buy(p.id, "defender");
+    else if (
+      army.robots.length < robotGoal &&
+      p.money >= GAME.units.robot.price
+    )
+      this.world.buy(p.id, "robot");
+    else if (
+      army.defenders.length < defenderGoal &&
+      p.money >= GAME.units.defender.price
+    )
+      this.world.buy(p.id, "defender");
+    else if (
+      army.attackers.length < attackerGoal &&
+      p.money >= GAME.units.attacker.price
+    )
+      this.world.buy(p.id, "attacker");
+  }
+  private planBotBuilding(
+    p: Player,
+    army: BotForces,
+    threatened: boolean,
+    now: number,
+  ) {
+    if (p.money < GAME.units.bastion.wallPrice) return;
+    const tiles = this.world.territoryCounts.get(p.id) ?? 0,
+      relayGoal = Math.min(6, Math.max(1, Math.ceil(tiles / 100))),
+      fortressGoal = Math.max(1, Math.ceil(tiles / 80)),
+      factoryGoal = Math.max(1, Math.ceil(tiles / 120)),
+      turretGoal = Math.max(1, Math.ceil(tiles / 100)),
+      wallGoal = threatened ? Math.min(6, 2 + Math.floor(tiles / 80)) : 0,
+      candidates = this.botBuildCandidates(p);
+    if (!candidates.length) return;
+    const unsupplied = candidates.find(
+      ({ x, y }) =>
+        !this.world.isTileSupplied(x, y) &&
+        !army.relays.some(
+          (relay) =>
+            Math.hypot(relay.x - x - 0.5, relay.y - y - 0.5) <
+            GAME.supply.relayRadius,
+        ),
+    );
+    if (unsupplied && army.relays.length < relayGoal) {
+      this.world.placeBastion(p.id, unsupplied.x, unsupplied.y, "relay", now);
+      return;
+    }
+    const frontier = candidates.find(({ x, y }) =>
+      [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ].some(([dx, dy]) => this.world.map.get(key(x + dx, y + dy))?.owner !== p.id),
+    );
+    if (
+      threatened &&
+      army.turrets.length < turretGoal &&
+      p.money >= GAME.units.bastion.turretPrice
+    ) {
+      const site = frontier ?? candidates[0];
+      this.world.placeBastion(p.id, site.x, site.y, "turret", now);
+      return;
+    }
+    if ((threatened || frontier) && army.fortresses.length < fortressGoal) {
+      const site = frontier ?? candidates[0];
+      this.world.placeBastion(p.id, site.x, site.y, "fortress", now);
+      return;
+    }
+    if (
+      threatened &&
+      army.walls.length < wallGoal &&
+      p.money >= GAME.units.bastion.wallPrice
+    ) {
+      const site = frontier ?? candidates[0];
+      this.world.placeBastion(p.id, site.x, site.y, "wall", now);
+      return;
+    }
+    if (army.factories.length < factoryGoal) {
+      const supplied = candidates.find(({ x, y }) =>
+        this.world.isTileSupplied(x, y),
+      );
+      const site = supplied ?? candidates[0];
+      this.world.placeBastion(p.id, site.x, site.y, "factory", now);
+    }
+  }
+  private botBuildCandidates(p: Player) {
+    const radius = Math.floor(GAME.units.bastion.placementRange),
+      occupied = new Set(
+        [...this.world.units.values()]
+          .filter(
+            (unit) =>
+              unit.kind === "bastion" || unit.kind === "headquarters",
+          )
+          .map((unit) => key(Math.floor(unit.x), Math.floor(unit.y))),
+      ),
+      candidates: Array<{ x: number; y: number; score: number }> = [];
+    for (let y = Math.max(0, Math.floor(p.y) - radius); y <= Math.min(GAME.map.height - 1, Math.floor(p.y) + radius); y++)
+      for (let x = Math.max(0, Math.floor(p.x) - radius); x <= Math.min(GAME.map.width - 1, Math.floor(p.x) + radius); x++) {
+        if (Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y) > radius) continue;
+        const tile = this.world.map.get(key(x, y));
+        if (!tile || tile.obstacle || tile.owner !== p.id) continue;
+        if (occupied.has(key(x, y))) continue;
+        candidates.push({ x, y, score: Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y) });
+      }
+    return candidates.sort((a, b) => a.score - b.score);
+  }
+  wireSnapshot(
+    clientId: string,
+    full = false,
+    tileKeys: string[] = [],
+    counts = this.world.allCounts(),
+  ) {
+    const snapshot = this.snapshot(clientId, full, tileKeys, counts);
+    return compactSnapshot(
+      snapshot,
+      this.unitDelta(clientId, snapshot.units, full),
+    );
+  }
+  unitDelta(
+    clientId: string,
+    units: ServerUnitView[],
+    full = false,
+  ): CompactUnitDelta {
+    let channel = this.unitChannels.get(clientId);
+    if (!channel) {
+      channel = { nextId: 1, ids: new Map(), previous: new Map() };
+      this.unitChannels.set(clientId, channel);
+    }
+    if (full) channel.previous.clear();
+    const created: CompactUnitDelta[0] = [],
+      updated: CompactUnitDelta[1] = [],
+      removed: number[] = [],
+      visible = new Set<string>();
+    for (const unit of units) {
+      visible.add(unit.id);
+      let numericId = channel.ids.get(unit.id);
+      if (!numericId) {
+        numericId = channel.nextId++;
+        channel.ids.set(unit.id, numericId);
+      }
+      const x = Math.max(
+          0,
+          Math.min(65535, Math.round(unit.x * POSITION_SCALE)),
+        ),
+        y = Math.max(
+          0,
+          Math.min(65535, Math.round(unit.y * POSITION_SCALE)),
+        ),
+        current: [number, number, number, number] = [
+          x,
+          y,
+          unit.hp,
+          unit.nextProduce,
+        ],
+        previous = channel.previous.get(unit.id);
+      if (!previous) {
+        created.push([
+          numericId,
+          unit.id,
+          unit.ownerId,
+          unit.kind === "robot"
+            ? 0
+            : unit.kind === "soldier"
+              ? 1
+              : unit.kind === "bastion"
+                ? 2
+                : unit.kind === "headquarters"
+                  ? 3
+                  : unit.kind === "attacker"
+                    ? 4
+                    : 5,
+          x,
+          y,
+          unit.hp,
+          unit.maxHp,
+          unit.nextProduce,
+          unit.bastionType === "fortress"
+            ? 1
+            : unit.bastionType === "factory"
+              ? 2
+              : unit.bastionType === "relay"
+                ? 3
+                : unit.bastionType === "wall"
+                  ? 4
+                  : unit.bastionType === "turret"
+                    ? 5
+                : 0,
+          Math.max(
+            0,
+            Math.min(
+              65535,
+              Math.round((unit.homeX ?? 0) * POSITION_SCALE),
+            ),
+          ),
+          Math.max(
+            0,
+            Math.min(
+              65535,
+              Math.round((unit.homeY ?? 0) * POSITION_SCALE),
+            ),
+          ),
+        ]);
+      } else if (
+        previous[0] !== current[0] ||
+        previous[1] !== current[1] ||
+        previous[2] !== current[2] ||
+        previous[3] !== current[3]
+      )
+        updated.push([numericId, ...current]);
+      channel.previous.set(unit.id, current);
+    }
+    for (const unitId of [...channel.previous.keys()])
+      if (!visible.has(unitId)) {
+        channel.previous.delete(unitId);
+        const numericId = channel.ids.get(unitId);
+        if (numericId) removed.push(numericId);
+        channel.ids.delete(unitId);
+      }
+    return [created, updated, removed, full ? 1 : 0];
+  }
+  snapshot(
+    clientId?: string,
+    full = false,
+    tileKeys: string[] = [],
+    counts = this.world.allCounts(),
+  ): Snapshot {
+    const ps = [...this.world.players.values()];
+    const leaderboard = ps
+      .map((p) => ({ ...p, ...counts.get(p.id)! }))
+      .sort((a, b) => b.tiles - a.tiles)
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        color: p.color,
+        tiles: p.tiles,
+        kills: p.kills,
+      }));
+    const focus = this.world.players.get(clientId ?? "") ?? ps[0],
+      radius = GAME.map.unitInterestRadius;
+    const nearby = focus
+      ? [...this.world.spatial.query(focus.x, focus.y, radius)]
+      : [];
+    const tiles: Snapshot["tiles"] = [];
+    const source = full ? [...this.world.map.keys()] : tileKeys;
+    for (const k of source) {
+      const t = this.world.map.get(k);
+      if (!t) continue;
+      if (full && !t.owner && !t.obstacle) continue;
+      const [x, y] = k.split(",").map(Number);
+      tiles.push([x, y, t.owner, t.obstacle ? 1 : 0, t.supplyDecay]);
+    }
+    const units = nearby
+      .filter((e): e is import("./model.js").Unit => "kind" in e)
+      .map(
+        ({
+          id,
+          ownerId,
+          kind,
+          x,
+          y,
+          hp,
+          nextProduce,
+          bastionType,
+          homeX,
+          homeY,
+        }) => ({
+        id,
+        ownerId,
+        kind,
+        x,
+        y,
+        hp,
+        maxHp:
+          kind === "bastion" && bastionType === "wall"
+            ? GAME.units.bastion.wallHp
+            : kind === "bastion" && bastionType === "turret"
+              ? GAME.units.bastion.turretHp
+              : GAME.units[kind].hp,
+        nextProduce,
+        bastionType,
+        homeX,
+        homeY,
+      }),
+      );
+    return {
+      now: Date.now(),
+      endsAt: this.world.endsAt,
+      width: GAME.map.width,
+      height: GAME.map.height,
+      players: ps.map((p) => ({ ...p, ...counts.get(p.id)! })),
+      units,
+      tiles,
+      leaderboard,
+      globalUnits: this.world.units.size,
+    };
+  }
+}

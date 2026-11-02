@@ -1,0 +1,15 @@
+{
+  "name": "tile-dominion",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently -n server,client -c magenta,cyan \"npm run dev -w @tile/server\" \"npm run dev -w @tile/client\"",
+    "build": "npm run build:rust && npm run build -w @tile/server && npm run build -w @tile/client",
+    "build:rust": "cargo build --release --manifest-path apps/simulation-rust/Cargo.toml",
+    "test:rust": "cargo test --manifest-path apps/simulation-rust/Cargo.toml",
+    "test": "npm run build:rust && npm run test:rust && npm run test -w @tile/server",
+    "benchmark": "npm run build:rust && npm run benchmark -w @tile/server",
+    "bots": "npm run bots -w @tile/server"
+  },
+  "devDependencies": {"concurrently": "^9.2.1"}
+}

@@ -1,0 +1,1 @@
+{"name":"@tile/client","private":true,"type":"module","scripts":{"dev":"vite --host 0.0.0.0","build":"tsc -b && vite build","preview":"vite preview --host 0.0.0.0"},"dependencies":{"@tile/game-config":"*","@tile/protocol":"*","colyseus.js":"latest","phaser":"latest"},"devDependencies":{"typescript":"latest","vite":"^6.1.0"}}
