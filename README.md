@@ -13,6 +13,16 @@ npm run dev
 
 Ouvrir `http://localhost:5173`. Pour simuler une foule après le démarrage : `npm run bots`. Tests : `npm test`. Build : `npm run build`. Docker : `docker compose up --build`.
 
+## Benchmarks
+
+`npm run benchmark` compile le moteur Rust puis mesure le moteur/IPC, le tick complet Rust→Node avec événements et la diffusion MessagePack multi-client. Les charges sont configurables sans modifier le code :
+
+```bash
+BENCH_COUNTS=1000,4000,8000 BENCH_PLAYERS=50 BENCH_CLIENTS=100 npm run benchmark
+```
+
+Les sous-benchmarks peuvent être lancés séparément avec `benchmark`, `benchmark:world` et `benchmark:pipeline` dans le workspace `@tile/server`. Le benchmark monde rapporte les latences p95/p99, le pic mémoire et les métriques de saturation du transport.
+
 ## Règles et contrôles
 
 - WASD, ZQSD ou flèches ; espace pour attaquer. Joystick et bouton d'attaque sur mobile.

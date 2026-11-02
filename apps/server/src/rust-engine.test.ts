@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Player, Unit } from "./model.js";
 import { RustEngine, rustExecutablePath } from "./rust-engine.js";
+import { GAME } from "@tile/game-config";
 
 describe("Rust engine executable", () => {
   it("uses the native executable name on Windows", () => {
@@ -110,6 +111,69 @@ describe("Rust engine executable", () => {
     }
   });
 
+  it("holds a robot only until its Rust-authoritative capture completes", async () => {
+    const engine = new RustEngine(),
+      robot = {
+        id: "capturing-robot", ownerId: "p1", kind: "robot",
+        x: 10.5, y: 10.5, hp: 45, dirX: 1, dirY: 0, order: "wander",
+        orderX: 10.5, orderY: 10.5, nextThink: 0, nextSimulationAt: 0,
+        lastSimulatedAt: 900, cachedTargetId: "", cachedTargetUntil: 0,
+        captureKey: "", captureSince: 0,
+      } as Unit,
+      map = new Map([["10,10", { owner: null, obstacle: false }]]);
+    try {
+      const first = await engine.scheduleDeltaWithEvents(
+        1000, [robot], [], [], [], map,
+      );
+      expect(first.schedules[0]).toMatchObject({ x: robot.x, y: robot.y });
+
+      const completed = await engine.scheduleDeltaWithEvents(
+        1000 + GAME.capture.holdMs * GAME.capture.robotMultiplier + 1,
+        [], [], [], [],
+      );
+      expect(completed.events).toContainEqual(expect.objectContaining({
+        kind: 0, entityId: robot.id, ownerId: robot.ownerId,
+      }));
+
+      const resumed = await engine.scheduleDeltaWithEvents(10000, [], [], [], []);
+      const schedule = resumed.schedules.find(({ id }) => id === robot.id)!;
+      expect(Math.hypot(schedule.x - robot.x, schedule.y - robot.y)).toBeGreaterThan(0);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("makes Rust authoritative for turret targeting and cooldown", async () => {
+    const engine = new RustEngine();
+    const turret = {
+      id: "turret", ownerId: "p1", kind: "bastion", bastionType: "turret",
+      x: 10, y: 10, hp: 360, dirX: 0, dirY: 0, order: "wander",
+      orderX: 10, orderY: 10, nextThink: 0, nextSimulationAt: 0,
+      lastSimulatedAt: 0, lastAttack: 0, cachedTargetId: "", cachedTargetUntil: 0,
+    } as Unit;
+    const enemy = {
+      id: "enemy", ownerId: "p2", kind: "robot", x: 12, y: 10, hp: 45,
+      dirX: 0, dirY: 0, order: "wander", orderX: 12, orderY: 10,
+      nextThink: Number.MAX_SAFE_INTEGER, nextSimulationAt: 0, lastSimulatedAt: 0,
+      cachedTargetId: "", cachedTargetUntil: 0,
+    } as Unit;
+    try {
+      const first = await engine.scheduleDeltaWithEvents(
+        2000, [turret, enemy], [], [], [],
+      );
+      expect(first.events).toContainEqual(expect.objectContaining({
+        kind: 1, entityId: "turret", targetId: "enemy",
+        amount: GAME.units.bastion.turretDamage,
+      }));
+      expect(first.schedules.find(({ id }) => id === "turret")?.last_attack).toBe(2000);
+
+      const second = await engine.scheduleDeltaWithEvents(2001, [], [], [], []);
+      expect(second.events).not.toContainEqual(expect.objectContaining({ entityId: "turret" }));
+    } finally {
+      engine.close();
+    }
+  });
+
   it("replaces a stale soldier direction with its follow order", async () => {
     const engine = new RustEngine(),
       soldier = {
@@ -148,14 +212,15 @@ describe("Rust engine executable", () => {
     }
   });
 
-  it("patrols a defender without leaving its guard circle", async () => {
+  it("keeps defenders on allied territory and returns isolated defenders", async () => {
     const engine = new RustEngine(),
+      map = new Map([["10,10", { owner: "p1", obstacle: false }]]),
       defender = {
         id: "u-defender",
         ownerId: "p1",
         kind: "defender",
-        x: 10,
-        y: 10,
+        x: 10.5,
+        y: 10.5,
         hp: 210,
         dirX: 1,
         dirY: 0,
@@ -169,12 +234,12 @@ describe("Rust engine executable", () => {
         cachedTargetUntil: 0,
       } as Unit;
     try {
-      const [patrol] = await engine.schedule(1000, [defender], []);
-      expect(Math.hypot(patrol.x - 10, patrol.y - 10)).toBeGreaterThan(0);
-      expect(Math.hypot(patrol.x - 10, patrol.y - 10)).toBeLessThan(12);
+      const [patrol] = await engine.schedule(1000, [defender], [], map);
+      expect(Math.floor(patrol.x)).toBe(10);
+      expect(Math.floor(patrol.y)).toBe(10);
 
-      defender.x = 21.9;
-      defender.y = 10;
+      defender.x = 12.5;
+      defender.y = 10.5;
       defender.dirX = 1;
       defender.dirY = 0;
       defender.nextThink = 5000;
@@ -182,7 +247,6 @@ describe("Rust engine executable", () => {
       defender.lastSimulatedAt = 1000;
       const [returned] = await engine.schedule(1500, [defender], []);
       expect(returned.x).toBeLessThan(defender.x);
-      expect(Math.hypot(returned.x - 10, returned.y - 10)).toBeLessThan(12);
     } finally {
       engine.close();
     }
@@ -360,6 +424,116 @@ describe("Rust engine executable", () => {
       expect(second.find(({ id }) => id === attacker.id)?.target_id).toBe(
         target.id,
       );
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("returns correlated combat events and transport metrics", async () => {
+    const engine = new RustEngine(),
+      attacker = {
+        id: "event-attacker", ownerId: "p1", kind: "soldier",
+        x: 10, y: 10, hp: 70, dirX: 1, dirY: 0, order: "wander",
+        orderX: 10, orderY: 10, nextThink: 0, nextSimulationAt: 0,
+        lastSimulatedAt: 900, cachedTargetId: "", cachedTargetUntil: 0,
+        lastAttack: 0, captureKey: "", captureSince: 0, nextProduce: 0,
+      } as Unit,
+      target = {
+        ...attacker, id: "event-target", ownerId: "p2", kind: "robot", x: 11,
+      } as Unit;
+    try {
+      const result = await engine.scheduleDeltaWithEvents(
+        1000, [attacker, target], [], [], [],
+      );
+      expect(result.events).toContainEqual(expect.objectContaining({
+        kind: 1,
+        entityId: attacker.id,
+        targetId: target.id,
+        amount: GAME.units.soldier.damage,
+      }));
+      expect(engine.transportMetrics).toMatchObject({
+        inFlight: 0,
+        completed: 1,
+        timedOut: 0,
+      });
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("removes a lethally damaged unit from the authoritative Rust world", async () => {
+    const engine = new RustEngine(),
+      attacker = {
+        id: "killer", ownerId: "p1", kind: "soldier", x: 10, y: 10,
+        hp: 70, dirX: 1, dirY: 0, order: "wander", orderX: 10, orderY: 10,
+        nextThink: 0, nextSimulationAt: 0, lastSimulatedAt: 900,
+        cachedTargetId: "", cachedTargetUntil: 0, lastAttack: 0,
+      } as Unit,
+      target = {
+        ...attacker, id: "victim", ownerId: "p2", kind: "robot", x: 11, hp: 5,
+      } as Unit;
+    try {
+      const result = await engine.scheduleDeltaWithEvents(
+        1000, [attacker, target], [], [], [],
+      );
+      expect(result.events).toContainEqual(expect.objectContaining({
+        kind: 3, entityId: "killer", targetId: "victim",
+      }));
+
+      const following = await engine.scheduleDeltaWithEvents(2000, [], [], [], []);
+      expect(following.schedules.some(({ id }) => id === "victim")).toBe(false);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("computes allied-territory damage reduction inside Rust", async () => {
+    const engine = new RustEngine(),
+      attacker = {
+        id: "armor-attacker", ownerId: "p1", kind: "soldier", x: 10, y: 10,
+        hp: 70, dirX: 1, dirY: 0, order: "wander", orderX: 10, orderY: 10,
+        nextThink: 0, nextSimulationAt: 0, lastSimulatedAt: 900,
+        cachedTargetId: "", cachedTargetUntil: 0, lastAttack: 0,
+      } as Unit,
+      target = {
+        ...attacker, id: "armored-target", ownerId: "p2", kind: "robot", x: 11,
+        hp: 45, nextSimulationAt: 2000,
+      } as Unit,
+      map = new Map([["11,10", { owner: "p2", obstacle: false }]]);
+    try {
+      const result = await engine.scheduleDeltaWithEvents(
+        1000, [attacker, target], [], [], [], map,
+      );
+      expect(result.events).toContainEqual(expect.objectContaining({
+        kind: 1,
+        targetId: target.id,
+        amount: GAME.units.soldier.damage * 0.5,
+      }));
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("returns unit production events from the persistent Rust state", async () => {
+    const engine = new RustEngine(),
+      factory = {
+        id: "factory", ownerId: "p1", kind: "bastion", bastionType: "factory",
+        x: 10.5, y: 10.5, hp: 420, dirX: 0, dirY: 0, order: "guard",
+        orderX: 10.5, orderY: 10.5, nextThink: Number.MAX_SAFE_INTEGER,
+        nextSimulationAt: 0, lastSimulatedAt: 0, cachedTargetId: "",
+        cachedTargetUntil: 0, lastAttack: 0, captureKey: "", captureSince: 0,
+        nextProduce: 1000,
+      } as Unit;
+    try {
+      const result = await engine.scheduleDeltaWithEvents(
+        1000, [factory], [], [], [],
+      );
+      expect(result.events).toContainEqual(expect.objectContaining({
+        kind: 2,
+        entityId: factory.id,
+        ownerId: factory.ownerId,
+        tileIndex: 0,
+      }));
     } finally {
       engine.close();
     }

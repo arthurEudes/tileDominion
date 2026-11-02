@@ -33,6 +33,8 @@ describe("per-client unit channel lifecycle", () => {
     expect(room.unitChannels.get("client")?.previous.size).toBe(0);
 
     const reentered = room.unitDelta("client", [unit("u1")]);
-    expect(reentered[0][0][0]).toBeGreaterThan(firstNumericId);
+    // IDs are global and stable so clients in the same interest cell can share
+    // the exact same encoded payload.
+    expect(reentered[0][0][0]).toBe(firstNumericId);
   });
 });

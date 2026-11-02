@@ -9,6 +9,7 @@
     "test": "vitest run",
     "benchmark": "tsx src/benchmark.ts",
     "benchmark:pipeline": "tsx src/pipeline-benchmark.ts",
+    "benchmark:world": "tsx src/world-benchmark.ts",
     "bots": "tsx src/bots.ts"
   },
   "dependencies": {

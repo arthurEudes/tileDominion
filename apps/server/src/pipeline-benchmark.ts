@@ -16,6 +16,11 @@ const counts = (process.env.BENCH_COUNTS ?? "1000,2000,4000,8000,16000,32000")
   .map(Number)
   .filter((value) => Number.isFinite(value) && value > 0);
 const iterations = Number(process.env.BENCH_ITERATIONS ?? 30);
+const clientCount = Math.max(1, Number(process.env.BENCH_CLIENTS ?? 50));
+const interestGroups = Math.max(
+  1,
+  Math.min(clientCount, Number(process.env.BENCH_INTEREST_GROUPS ?? 10)),
+);
 
 function percentile(values: number[], ratio: number) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -97,6 +102,43 @@ for (const count of counts) {
   const clientDecodeAndApply = measure(() => {
     expandSnapshot(decode(movingPayload) as CompactSnapshot, clientUnits);
   });
+  const fanoutServer = roomWithoutRuntime(),
+    clientIds = Array.from({ length: clientCount }, (_, index) => `client-${index}`);
+  for (const clientId of clientIds)
+    fanoutServer.unitDelta(clientId, allUnits, true);
+  let fanoutBytes = 0;
+  const multiClientFanout = measure(() => {
+    fanoutBytes = 0;
+    for (const clientId of clientIds) {
+      const wire = compactSnapshot(
+        snapshot,
+        fanoutServer.unitDelta(clientId, allUnits),
+      );
+      fanoutBytes += encode(wire).byteLength;
+    }
+    for (const unit of allUnits) unit.y += 1 / POSITION_SCALE;
+  });
+  const sharedServer = roomWithoutRuntime(),
+    visiblePerCell = Math.ceil(allUnits.length / interestGroups),
+    clientsPerCell = Math.ceil(clientCount / interestGroups);
+  let sharedFanoutBytes = 0;
+  const sharedSpatialFanout = measure(() => {
+    sharedFanoutBytes = 0;
+    for (let group = 0; group < interestGroups; group++) {
+      const visible = allUnits.slice(
+          group * visiblePerCell,
+          Math.min(allUnits.length, (group + 1) * visiblePerCell),
+        ),
+        groupSnapshot = baseSnapshot(visible),
+        wire = compactSnapshot(
+          groupSnapshot,
+          sharedServer.unitDelta(`interest:${group}`, visible),
+        ),
+        bytes = encode(wire).byteLength;
+      sharedFanoutBytes += bytes * clientsPerCell;
+    }
+    for (const unit of allUnits) unit.x += 1 / POSITION_SCALE;
+  });
   const result = {
     units: count,
     initialBytes: initialPayload.byteLength,
@@ -104,6 +146,13 @@ for (const count of counts) {
     idleDeltaP95Ms: idleDelta.p95Ms,
     movingDeltaEncodeP95Ms: movingDeltaAndEncode.p95Ms,
     clientDecodeApplyP95Ms: clientDecodeAndApply.p95Ms,
+    clients: clientCount,
+    fanoutBytes,
+    multiClientFanoutP95Ms: multiClientFanout.p95Ms,
+    interestGroups,
+    visiblePerCell,
+    sharedFanoutBytes,
+    sharedSpatialFanoutP95Ms: sharedSpatialFanout.p95Ms,
   };
   results.push(result);
   console.log(JSON.stringify(result));

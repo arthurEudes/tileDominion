@@ -62,6 +62,28 @@ describe("authoritative rules", () => {
     expect(soldier.x).toBe(movedX);
     expect(robot.hp).toBe(hp - GAME.units.soldier.damage);
   });
+  it("projects a Rust EntityKilled event without recalculating damage", async () => {
+    const w = world(),
+      owner = w.addPlayer("owner", "Owner", 1),
+      enemy = w.addPlayer("enemy", "Enemy", 2);
+    enemy.money = 999;
+    w.buy(enemy.id, "robot");
+    const victim = [...w.units.values()].find(
+      (unit) => unit.ownerId === enemy.id && unit.kind === "robot",
+    )!;
+    const engine = {
+      scheduleDeltaWithEvents: () => Promise.resolve({
+        schedules: [],
+        events: [{
+          kind: 3, entityId: null, targetId: victim.id,
+          tileIndex: 0, amount: victim.hp, ownerId: owner.id,
+        }],
+      }),
+    } as unknown as RustEngine;
+
+    await w.tickWithRust(engine, 0.05, 1000);
+    expect(w.units.has(victim.id)).toBe(false);
+  });
   it("keeps captured tile deltas until Rust acknowledges them", async () => {
     const w = world(),
       player = w.addPlayer("a", "A", 1),
@@ -133,8 +155,7 @@ describe("authoritative rules", () => {
     w.tick(GAME.economy.incomeIntervalMs / 1000);
     expect(p.money).toBe(
       before +
-        Math.floor(w.counts("a").tiles * GAME.economy.incomePerTile) +
-        GAME.economy.headquartersIncome,
+        Math.floor(w.counts("a").tiles * GAME.economy.incomePerTile),
     );
   });
   it("limits AI capture searches to its configured local radius", () => {
@@ -226,7 +247,7 @@ describe("authoritative rules", () => {
     for (let i = 0; i < 20; i++) expect(w.buy("a", "robot")).toBe(true);
     expect(w.counts("a").robots).toBe(20);
   });
-  it("directs robots toward the nearest non-allied tile", () => {
+  it("directs robots toward one of the three nearest non-allied tiles", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1);
     p.money = 999;
@@ -237,10 +258,14 @@ describe("authoritative rules", () => {
     for (const tile of w.map.values()) tile.owner = p.id;
     w.map.get(key(103, 100))!.owner = null;
     w.map.get(key(95, 100))!.owner = null;
+    w.map.get(key(100, 104))!.owner = null;
     robot.nextThink = 0;
     w.tickUnit(robot, 0.1, 1000);
-    expect(robot.orderX).toBe(103.5);
-    expect(robot.dirX).toBeGreaterThan(0);
+    expect([
+      "103.5,100.5",
+      "95.5,100.5",
+      "100.5,104.5",
+    ]).toContain(`${robot.orderX},${robot.orderY}`);
   });
   it("restores robots to their original speed", () => {
     const w = world(),
@@ -349,32 +374,27 @@ describe("authoritative rules", () => {
       ),
     ).toHaveLength(GAME.units.bastion.maxDefenders);
   });
-  it("patrols defenders inside their doubled guard radius", () => {
+  it("keeps defenders on allied territory and returns them when isolated", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1);
     p.money = 999;
     w.buy(p.id, "defender");
     const defender = [...w.units.values()].find(
         (unit) => unit.kind === "defender",
-      )!,
-      homeX = defender.homeX!,
-      homeY = defender.homeY!;
-    expect(GAME.units.defender.guardRadius).toBe(12);
-    defender.nextThink = 0;
+      )!;
+    const alliedX = Math.floor(defender.x),
+      alliedY = Math.floor(defender.y);
+    defender.dirX = 1;
+    defender.dirY = 0;
+    defender.nextThink = 5000;
     w.tickUnit(defender, 1, 1000);
-    expect(Math.hypot(defender.x - homeX, defender.y - homeY)).toBeGreaterThan(
-      0,
-    );
-    expect(Math.hypot(defender.x - homeX, defender.y - homeY)).toBeLessThan(
-      GAME.units.defender.guardRadius,
-    );
+    expect(
+      w.map.get(key(Math.floor(defender.x), Math.floor(defender.y)))?.owner,
+    ).toBe(p.id);
 
-    defender.x = homeX + GAME.units.defender.guardRadius + 3;
-    defender.y = homeY;
-    w.tickUnit(defender, 0, 2000);
-    expect(Math.hypot(defender.x - homeX, defender.y - homeY)).toBeLessThan(
-      GAME.units.defender.guardRadius,
-    );
+    defender.x = alliedX + 3.5;
+    defender.y = alliedY + 0.5;
+    w.tickUnit(defender, 0.5, 2000);
     expect(defender.dirX).toBeLessThan(0);
   });
   it("blocks allied and enemy movement with a destructible wall", () => {
@@ -432,11 +452,8 @@ describe("authoritative rules", () => {
   it("halves isolated territory income and eventually neutralizes it", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1),
-      headquarters = [...w.units.values()].find(
-        (u) => u.ownerId === p.id && u.kind === "headquarters",
-      )!,
-      farX = headquarters.x < GAME.map.width / 2 ? GAME.map.width - 5 : 4,
-      farY = headquarters.y < GAME.map.height / 2 ? GAME.map.height - 5 : 4,
+      farX = p.x < GAME.map.width / 2 ? GAME.map.width - 5 : 4,
+      farY = p.y < GAME.map.height / 2 ? GAME.map.height - 5 : 4,
       farKey = key(farX, farY),
       farTile = w.map.get(farKey)!,
       now = Date.now() + 1000;
@@ -451,7 +468,7 @@ describe("authoritative rules", () => {
         ((w.suppliedTerritoryCounts.get(p.id) ?? 0) +
           (w.unsuppliedTerritoryCounts.get(p.id) ?? 0) * 0.5) *
           GAME.economy.incomePerTile,
-      ) + GAME.economy.headquartersIncome,
+      ),
     );
 
     w.tick(0, now + GAME.supply.decayMs + GAME.supply.updateIntervalMs);
@@ -461,11 +478,9 @@ describe("authoritative rules", () => {
   it("allows an independent relay to supply a remote enclave", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1),
-      headquarters = [...w.units.values()].find(
-        (u) => u.ownerId === p.id && u.kind === "headquarters",
-      )!,
-      x = headquarters.x < GAME.map.width / 2 ? GAME.map.width - 5 : 4,
-      y = headquarters.y < GAME.map.height / 2 ? GAME.map.height - 5 : 4,
+      origin = { x: p.x, y: p.y },
+      x = p.x < GAME.map.width / 2 ? GAME.map.width - 5 : 4,
+      y = p.y < GAME.map.height / 2 ? GAME.map.height - 5 : 4,
       enclave = w.map.get(key(x, y))!,
       now = Date.now() + 1000;
     w.setOwner(key(x, y), enclave, p.id);
@@ -473,9 +488,34 @@ describe("authoritative rules", () => {
     p.y = y + 0.5;
     p.money = GAME.units.bastion.price;
     expect(w.placeBastion(p.id, x, y, "relay", now)).toBe(true);
+    p.x = origin.x;
+    p.y = origin.y;
     w.tick(0, now + GAME.supply.updateIntervalMs);
     expect(w.suppliedTiles[y * GAME.map.width + x]).toBe(1);
     expect(enclave.supplyDecay).toBe(0);
+  });
+  it("anchors supply to an abstract capital instead of the character", () => {
+    const w = world(),
+      p = w.addPlayer("a", "A", 1),
+      capital = w.capitals.get(p.id)!;
+    p.x = Math.min(GAME.map.width - 1, capital.x + 80);
+    p.y = Math.min(GAME.map.height - 1, capital.y + 80);
+
+    w.tick(0, Date.now() + GAME.supply.updateIntervalMs + 1);
+    expect(w.isTileSupplied(capital.x, capital.y)).toBe(true);
+    expect(w.map.get(key(capital.x, capital.y))?.owner).toBe(p.id);
+  });
+  it("relocates a captured abstract capital onto allied territory", () => {
+    const w = world(),
+      p = w.addPlayer("a", "A", 1),
+      enemy = w.addPlayer("b", "B", 2),
+      previous = w.capitals.get(p.id)!,
+      tile = w.map.get(key(previous.x, previous.y))!;
+
+    w.setOwner(key(previous.x, previous.y), tile, enemy.id);
+    const relocated = w.capitals.get(p.id)!;
+    expect(relocated).not.toEqual(previous);
+    expect(w.map.get(key(relocated.x, relocated.y))?.owner).toBe(p.id);
   });
   it("orders only the owner's soldiers", () => {
     const w = world(),
@@ -520,24 +560,17 @@ describe("authoritative rules", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1);
     for (const t of w.map.values()) if (t.owner === "a") t.owner = null;
-    for (const [id, unit] of w.units)
-      if (unit.ownerId === "a" && unit.kind === "headquarters")
-        w.units.delete(id);
     w.damagePlayer(p, 999, "x");
     expect(p.alive).toBe(false);
   });
   it("respawns with territory", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1);
-    const headquarters = [...w.units.values()].find(
-      (u) => u.kind === "headquarters",
-    )!;
     p.x += 3;
     w.damagePlayer(p, 999, "x");
     expect(p.alive).toBe(true);
     expect(p.hp).toBe(p.maxHp);
-    expect(p.x).toBe(headquarters.x);
-    expect(p.y).toBe(headquarters.y);
+    expect(w.map.get(key(Math.floor(p.x), Math.floor(p.y)))?.owner).toBe(p.id);
   });
   it("destroys robot", () => {
     const w = world(),
@@ -562,6 +595,22 @@ describe("authoritative rules", () => {
     ).toBe(p.id);
     w.damageUnit(robot, 20);
     expect(robot.hp).toBe(hp - 10);
+  });
+  it("does not let player characters attack", () => {
+    const w = world(),
+      attacker = w.addPlayer("a", "A", 1, true),
+      target = w.addPlayer("b", "B", 2);
+    attacker.x = target.x = 20;
+    attacker.y = target.y = 20;
+    w.setInput(attacker.id, { x: 0, y: 0, attack: true, seq: 1 });
+    expect(attacker.input.attack).toBe(false);
+    target.invulnerableUntil = 0;
+    const hp = target.hp;
+    w.spatial.rebuild(w.players.values(), w.units.values());
+
+    w.tickPlayer(attacker, 0.05, 10000);
+    expect(target.hp).toBe(hp);
+    expect(attacker.lastAttack).toBe(0);
   });
   it("soldier attacks an enemy robot", () => {
     const w = world(),
@@ -797,12 +846,12 @@ describe("authoritative rules", () => {
     expect(w.allCounts().get(a.id)).toMatchObject({
       robots: 1,
       soldiers: 1,
-      headquarters: 1,
+      headquarters: 0,
     });
     expect(w.allCounts().get(b.id)).toMatchObject({
       robots: 0,
       soldiers: 1,
-      headquarters: 1,
+      headquarters: 0,
     });
   });
 });

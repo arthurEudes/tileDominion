@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 
+pub mod zoned_world;
+
 pub const CHUNK_SIZE: f32 = 16.0;
 pub const TILE_BUCKET_SIZE: u32 = 8;
 
@@ -19,6 +21,23 @@ pub struct SimulationConfig {
     pub target_cache_ms: u64,
     pub tick_budget_us: u64,
     pub defender_guard_radius: f32,
+    pub robot_capture_ms: u64,
+    pub enemy_capture_multiplier: f32,
+    pub soldier_damage: f32,
+    pub attacker_damage: f32,
+    pub defender_damage: f32,
+    pub soldier_range: f32,
+    pub attacker_range: f32,
+    pub defender_range: f32,
+    pub soldier_cooldown_ms: u64,
+    pub attacker_cooldown_ms: u64,
+    pub defender_cooldown_ms: u64,
+    pub fortress_production_ms: u64,
+    pub factory_production_ms: u64,
+    pub max_defenders: usize,
+    pub turret_damage: f32,
+    pub turret_range: f32,
+    pub turret_cooldown_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -66,6 +85,18 @@ pub struct UnitState {
     pub cached_target_until: u64,
     #[serde(default)]
     pub blocks_movement: bool,
+    #[serde(default)]
+    pub last_attack: u64,
+    #[serde(default)]
+    pub capture_tile: Option<u32>,
+    #[serde(default)]
+    pub capture_since: u64,
+    #[serde(default)]
+    pub bastion_type: u8,
+    #[serde(default)]
+    pub next_produce: u64,
+    #[serde(default)]
+    pub source_bastion_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -96,6 +127,7 @@ pub struct TickRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EngineRequest {
     pub protocol_version: u8,
+    pub request_id: u32,
     pub now: u64,
     pub detection_range: f32,
     pub intermediate_radius: f32,
@@ -141,6 +173,7 @@ pub struct UnitSchedule {
     pub dir_x: f32,
     pub dir_y: f32,
     pub next_think: u64,
+    pub last_attack: u64,
 }
 
 fn default_order() -> String {
@@ -156,12 +189,25 @@ pub struct EngineMetrics {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SimulationEvent {
+    pub kind: u8,
+    pub entity_id: u32,
+    pub target_id: u32,
+    pub tile_index: u32,
+    pub amount: f32,
+    pub owner_id: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TickResponse {
+    pub request_id: u32,
     pub schedules: Vec<UnitSchedule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<EngineMetrics>,
     #[serde(default)]
     pub next_cursor: usize,
+    #[serde(default)]
+    pub events: Vec<SimulationEvent>,
 }
 
 #[derive(Default)]
@@ -365,15 +411,53 @@ impl TileTargetIndex {
         owner_id: u32,
         owners: &[u32],
     ) -> Option<(f32, f32)> {
+        self.nearest_candidates(x, y, owner_id, owners, false, 1)
+            .into_iter()
+            .next()
+    }
+
+    pub fn nearest_non_allied_candidates(
+        &self,
+        x: f32,
+        y: f32,
+        owner_id: u32,
+        owners: &[u32],
+        limit: usize,
+    ) -> Vec<(f32, f32)> {
+        self.nearest_candidates(x, y, owner_id, owners, false, limit)
+    }
+
+    pub fn nearest_allied(
+        &self,
+        x: f32,
+        y: f32,
+        owner_id: u32,
+        owners: &[u32],
+    ) -> Option<(f32, f32)> {
+        self.nearest_candidates(x, y, owner_id, owners, true, 1)
+            .into_iter()
+            .next()
+    }
+
+    fn nearest_candidates(
+        &self,
+        x: f32,
+        y: f32,
+        owner_id: u32,
+        owners: &[u32],
+        allied: bool,
+        limit: usize,
+    ) -> Vec<(f32, f32)> {
         if self.width == 0 || self.height == 0 {
-            return None;
+            return Vec::new();
         }
         let center_x = (x.max(0.0) as u32 / TILE_BUCKET_SIZE) as i32;
         let center_y = (y.max(0.0) as u32 / TILE_BUCKET_SIZE) as i32;
         let bucket_columns = self.width.div_ceil(TILE_BUCKET_SIZE) as i32;
         let bucket_rows = self.height.div_ceil(TILE_BUCKET_SIZE) as i32;
         let max_ring = bucket_columns.max(bucket_rows);
-        let mut best = None::<(f32, f32, f32)>;
+        let limit = limit.max(1);
+        let mut best = Vec::<(f32, f32, f32)>::with_capacity(limit);
 
         for ring in 0..=max_ring {
             for bucket_y in center_y - ring..=center_y + ring {
@@ -396,7 +480,8 @@ impl TileTargetIndex {
                         .into_iter()
                         .flatten()
                     {
-                        if owners.get(*index as usize).copied() == Some(owner_id) {
+                        let is_allied = owners.get(*index as usize).copied() == Some(owner_id);
+                        if is_allied != allied {
                             continue;
                         }
                         let tile_x = (*index % self.width) as f32 + 0.5;
@@ -404,13 +489,14 @@ impl TileTargetIndex {
                         let dx = tile_x - x;
                         let dy = tile_y - y;
                         let distance_sq = dx * dx + dy * dy;
-                        if best.is_none_or(|(_, _, best_distance)| distance_sq < best_distance) {
-                            best = Some((tile_x, tile_y, distance_sq));
-                        }
+                        best.push((tile_x, tile_y, distance_sq));
+                        best.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+                        best.truncate(limit);
                     }
                 }
             }
-            if let Some((_, _, best_distance_sq)) = best {
+            if best.len() == limit {
+                let best_distance_sq = best.last().map(|candidate| candidate.2).unwrap_or_default();
                 let min_x = ((center_x - ring).max(0) as u32 * TILE_BUCKET_SIZE) as f32;
                 let min_y = ((center_y - ring).max(0) as u32 * TILE_BUCKET_SIZE) as f32;
                 let max_x = (((center_x + ring + 1).min(bucket_columns) as u32 * TILE_BUCKET_SIZE)
@@ -437,7 +523,7 @@ impl TileTargetIndex {
                 }
             }
         }
-        best.map(|(tile_x, tile_y, _)| (tile_x, tile_y))
+        best.into_iter().map(|(tile_x, tile_y, _)| (tile_x, tile_y)).collect()
     }
 
     fn insert(&mut self, index: u32) {
@@ -490,11 +576,7 @@ pub fn schedule_tick(request: &mut TickRequest) -> TickResponse {
         let max_sq = request.detection_range * request.detection_range;
         let target_in_role_area = |target_x: f32, target_y: f32| match unit.kind {
             UnitKind::Attacker => true,
-            UnitKind::Defender => {
-                distance_sq(unit.order_x, unit.order_y, target_x, target_y)
-                    <= request.config.defender_guard_radius.powi(2)
-            }
-            UnitKind::Soldier => {
+            UnitKind::Soldier | UnitKind::Defender => {
                 distance_sq(unit.x, unit.y, target_x, target_y) <= max_sq * 1.25_f32.powi(2)
             }
             _ => false,
@@ -541,19 +623,13 @@ pub fn schedule_tick(request: &mut TickRequest) -> TickResponse {
                         other.id != unit.id
                             && other.owner_id != unit.owner_id
                             && distance_sq(unit.x, unit.y, other.x, other.y) <= max_sq
-                            && (unit.kind != UnitKind::Defender
-                                || distance_sq(unit.order_x, unit.order_y, other.x, other.y)
-                                    <= request.config.defender_guard_radius.powi(2))
                     }),
             );
             nearby_humans.extend(request.humans.iter().enumerate().filter_map(
                 |(human_index, human)| {
                     (human.id != unit.owner_id
                         && human.alive
-                        && distance_sq(unit.x, unit.y, human.x, human.y) <= max_sq
-                        && (unit.kind != UnitKind::Defender
-                            || distance_sq(unit.order_x, unit.order_y, human.x, human.y)
-                                <= request.config.defender_guard_radius.powi(2)))
+                        && distance_sq(unit.x, unit.y, human.x, human.y) <= max_sq)
                     .then_some(human_index)
                 },
             ));
@@ -628,9 +704,11 @@ pub fn schedule_tick(request: &mut TickRequest) -> TickResponse {
             dir_x: unit.dir_x,
             dir_y: unit.dir_y,
             next_think: unit.next_think,
+            last_attack: unit.last_attack,
         });
     }
     TickResponse {
+        request_id: 0,
         schedules,
         metrics: None,
         next_cursor: if unit_count == 0 {
@@ -638,6 +716,7 @@ pub fn schedule_tick(request: &mut TickRequest) -> TickResponse {
         } else {
             (start_index + visited) % unit_count
         },
+        events: Vec::new(),
     }
 }
 
@@ -663,6 +742,12 @@ mod tests {
             cached_target_id: None,
             cached_target_until: 0,
             blocks_movement: false,
+            last_attack: 0,
+            capture_tile: None,
+            capture_since: 0,
+            bastion_type: 0,
+            next_produce: 0,
+            source_bastion_id: None,
         }
     }
     fn human(id: u32, x: f32, invulnerable_until: u64) -> HumanState {
@@ -689,6 +774,23 @@ mod tests {
             target_cache_ms: 2000,
             tick_budget_us: 35_000,
             defender_guard_radius: 12.0,
+            robot_capture_ms: 1100,
+            enemy_capture_multiplier: 3.0,
+            soldier_damage: 12.0,
+            attacker_damage: 12.0,
+            defender_damage: 18.0,
+            soldier_range: 3.2,
+            attacker_range: 3.2,
+            defender_range: 3.2,
+            soldier_cooldown_ms: 800,
+            attacker_cooldown_ms: 800,
+            defender_cooldown_ms: 800,
+            fortress_production_ms: 9000,
+            factory_production_ms: 6500,
+            max_defenders: 8,
+            turret_damage: 16.0,
+            turret_range: 8.0,
+            turret_cooldown_ms: 900,
         }
     }
     #[test]
@@ -831,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn defender_drops_a_target_that_leaves_its_guard_circle() {
+    fn defender_drops_a_target_that_leaves_detection_range() {
         let mut defender = unit(1, 10, UnitKind::Defender, 10.0);
         defender.cached_target_id = Some(2);
         defender.cached_target_until = 500;
@@ -897,20 +999,26 @@ mod tests {
         let mut owners = vec![10; 16 * 16];
         owners[2] = 0;
         owners[3] = 20;
+        owners[16] = 0;
         let mut obstacles = std::collections::HashSet::new();
         let mut index = TileTargetIndex::default();
         index.rebuild(16, 16, &obstacles);
         assert_eq!(
             index.nearest_non_allied(0.5, 0.5, 10, &owners),
-            Some((2.5, 0.5))
+            Some((0.5, 1.5))
+        );
+        assert_eq!(
+            index.nearest_non_allied_candidates(0.5, 0.5, 10, &owners, 3),
+            vec![(0.5, 1.5), (2.5, 0.5), (3.5, 0.5)]
         );
 
         obstacles.insert(2);
         index.set_obstacle(2, true);
         assert_eq!(
             index.nearest_non_allied(0.5, 0.5, 10, &owners),
-            Some((3.5, 0.5))
+            Some((0.5, 1.5))
         );
+        assert_eq!(index.nearest_allied(2.5, 0.5, 10, &owners), Some((1.5, 0.5)));
     }
 
     #[test]

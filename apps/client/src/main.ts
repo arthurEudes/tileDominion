@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import { Client, Room } from "colyseus.js";
+import { decode } from "@msgpack/msgpack";
 import {
   expandSnapshot,
   type CompactSnapshot,
@@ -73,7 +74,7 @@ class Dominion extends Phaser.Scene {
     sceneRef = this;
     this.cameras.main.setBackgroundColor(0x0a1827);
     this.cursors = this.input.keyboard!.createCursorKeys();
-    this.keys = this.input.keyboard!.addKeys("W,A,S,D,Z,Q,SPACE");
+    this.keys = this.input.keyboard!.addKeys("W,A,S,D,Z,Q");
     this.cameras.main.setZoom(1.15);
     this.createUnitBatches();
     this.setupTouch();
@@ -456,7 +457,7 @@ class Dominion extends Phaser.Scene {
         seq: ++seq,
         x,
         y,
-        attack: this.keys.SPACE.isDown || attackDown,
+        attack: false,
       });
     }
     const own = this.actors.get(myId),
@@ -681,9 +682,6 @@ const game = new Phaser.Game({
   scene: [Dominion],
   scale: { mode: Phaser.Scale.RESIZE },
 });
-let attackDown = false;
-$("#attack").addEventListener("pointerdown", () => (attackDown = true));
-$("#attack").addEventListener("pointerup", () => (attackDown = false));
 $("#shopToggle").onclick = () => {
   const s = $("#shop");
   s.hidden = !s.hidden;
@@ -743,7 +741,10 @@ $("#play").onclick = async () => {
       import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567",
     ).joinOrCreate("dominion", { name });
     myId = room.sessionId;
-    room.onMessage("state", (wire: CompactSnapshot) => {
+    room.onMessage("state", (payload: CompactSnapshot | Uint8Array) => {
+      const wire = payload instanceof Uint8Array
+        ? (decode(payload) as CompactSnapshot)
+        : payload;
       const s = expandSnapshot(wire, clientUnits);
       for (const [x, y, , ob] of s.tiles) {
         const k = `${x},${y}`;

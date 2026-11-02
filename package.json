@@ -8,7 +8,7 @@
     "build:rust": "cargo build --release --manifest-path apps/simulation-rust/Cargo.toml",
     "test:rust": "cargo test --manifest-path apps/simulation-rust/Cargo.toml",
     "test": "npm run build:rust && npm run test:rust && npm run test -w @tile/server",
-    "benchmark": "npm run build:rust && npm run benchmark -w @tile/server",
+    "benchmark": "npm run build:rust && npm run benchmark -w @tile/server && npm run benchmark:world -w @tile/server && npm run benchmark:pipeline -w @tile/server",
     "bots": "npm run bots -w @tile/server"
   },
   "devDependencies": {"concurrently": "^9.2.1"}

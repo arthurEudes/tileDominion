@@ -159,3 +159,35 @@ for (const scenario of ["robots", "combat"] as const)
     console.log(JSON.stringify(result));
   }
 console.table(results);
+
+const inFlight = Math.max(2, Number(process.env.BENCH_IN_FLIGHT ?? 8)),
+  saturationCount = counts[counts.length - 1],
+  saturationEngine = new RustEngine(),
+  saturationUnits = units(saturationCount, "combat"),
+  saturationPlayers = [player("p0", 100, 100), player("p1", 101, 100)];
+try {
+  const started = performance.now();
+  const settled = await Promise.allSettled(
+    Array.from({ length: inFlight }, (_, index) =>
+      saturationEngine.scheduleDeltaWithEvents(
+        2_000_000 + index * 50,
+        index === 0 ? saturationUnits : [],
+        [],
+        saturationPlayers,
+        [],
+        index === 0 ? map : undefined,
+      ),
+    ),
+  );
+  console.log(JSON.stringify({
+    scenario: "transport-saturation",
+    units: saturationCount,
+    requests: inFlight,
+    elapsedMs: performance.now() - started,
+    completedRequests: settled.filter(({ status }) => status === "fulfilled").length,
+    failedRequests: settled.filter(({ status }) => status === "rejected").length,
+    ...saturationEngine.transportMetrics,
+  }));
+} finally {
+  saturationEngine.close();
+}

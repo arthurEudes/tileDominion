@@ -1,4 +1,5 @@
 import { Room, Client } from "colyseus";
+import { encode } from "@msgpack/msgpack";
 import { COLORS, GAME } from "@tile/game-config";
 import {
   BuySchema,
@@ -20,13 +21,14 @@ type BotForces = {
   robots: Unit[];
   attackers: Unit[];
   defenders: Unit[];
-  headquarters?: Unit;
   fortresses: Unit[];
   factories: Unit[];
   relays: Unit[];
   walls: Unit[];
   turrets: Unit[];
 };
+
+const INTEREST_CELL_SIZE = 16;
 
 export class DominionRoom extends Room {
   maxClients = GAME.room.maxPlayers;
@@ -46,15 +48,16 @@ export class DominionRoom extends Room {
       previous: Map<string, [number, number, number, number]>;
     }
   >();
+  clientInterestCells = new Map<string, string>();
+  globalUnitIds = new Map<string, number>();
+  nextGlobalUnitId = 1;
   onCreate() {
     for (let i = 0; i < GAME.bots.count; i++) this.addBot();
     this.setSimulationInterval(
       (dt) => void this.step(dt / 1000),
       1000 / GAME.room.tickRate,
     );
-    this.onMessage("ready", (c) =>
-      c.send("state", this.wireSnapshot(c.sessionId, true)),
-    );
+    this.onMessage("ready", (c) => this.sendFullInterestState(c));
     this.onMessage("input", (c, m) => {
       if (!this.allow(c)) return;
       const v = InputSchema.safeParse(m);
@@ -96,7 +99,7 @@ export class DominionRoom extends Room {
         message,
         ...counts,
       });
-      if (p) c.send("state", this.wireSnapshot(c.sessionId));
+      if (p) this.sendFullInterestState(c);
     });
     this.onMessage("build", (c, m) => {
       if (!this.allow(c)) return;
@@ -189,11 +192,7 @@ export class DominionRoom extends Room {
         this.elapsed = 0;
         const changed = [...this.world.dirtyTiles],
           counts = this.world.allCounts();
-        for (const c of this.clients)
-          c.send(
-            "state",
-            this.wireSnapshot(c.sessionId, false, changed, counts),
-          );
+        this.broadcastInterestStates(changed, counts);
         this.world.dirtyTiles.clear();
       }
     } catch (error) {
@@ -226,7 +225,7 @@ export class DominionRoom extends Room {
       });
     const structures: Unit[] = [];
     for (const unit of this.world.units.values()) {
-      if (unit.kind === "headquarters" || unit.kind === "bastion")
+      if (unit.kind === "bastion")
         structures.push(unit);
       const army = forces.get(unit.ownerId);
       if (!army) continue;
@@ -234,7 +233,6 @@ export class DominionRoom extends Room {
       else if (unit.kind === "defender") army.defenders.push(unit);
       else if (unit.kind === "soldier" || unit.kind === "attacker")
         army.attackers.push(unit);
-      else if (unit.kind === "headquarters") army.headquarters = unit;
       else if (unit.bastionType === "factory") army.factories.push(unit);
       else if (unit.bastionType === "relay") army.relays.push(unit);
       else if (unit.bastionType === "wall") army.walls.push(unit);
@@ -247,7 +245,7 @@ export class DominionRoom extends Room {
         now + GAME.bots.thinkIntervalMs + Math.random() * 400,
       );
       const army = forces.get(p.id)!;
-      const threatened = this.findBotThreat(p, army.headquarters);
+      const threatened = this.findBotThreat(p);
       const strategicTarget = this.findEnemyStructure(p, structures);
       const target = threatened
         ? { x: threatened.x, y: threatened.y }
@@ -260,7 +258,7 @@ export class DominionRoom extends Room {
       p.input = {
         x: Math.cos(a),
         y: Math.sin(a),
-        attack: true,
+        attack: false,
         seq: p.input.seq + 1,
       };
       if (strategicTarget && army.attackers.length)
@@ -317,6 +315,7 @@ export class DominionRoom extends Room {
   }
   private cleanupClient(id: string) {
     this.unitChannels.delete(id);
+    this.clientInterestCells.delete(id);
     this.rates.delete(id);
   }
   private botStrength(id: string) {
@@ -330,8 +329,8 @@ export class DominionRoom extends Room {
       }
     return (this.world.territoryCounts.get(id) ?? 0) * 2 + units + structures * 8;
   }
-  private findBotThreat(p: Player, headquarters?: Unit) {
-    const origin = headquarters ?? p,
+  private findBotThreat(p: Player) {
+    const origin = p,
       radius = 12;
     let nearest: Player | Unit | undefined,
       best = Number.POSITIVE_INFINITY;
@@ -478,6 +477,165 @@ export class DominionRoom extends Room {
       }
     return candidates.sort((a, b) => a.score - b.score);
   }
+  private interestCellFor(clientId: string) {
+    const player = this.world.players.get(clientId);
+    if (!player) return "0,0";
+    return `${Math.floor(player.x / INTEREST_CELL_SIZE)},${Math.floor(player.y / INTEREST_CELL_SIZE)}`;
+  }
+  private sendFullInterestState(client: Client) {
+    const cell = this.interestCellFor(client.sessionId),
+      counts = this.world.allCounts(),
+      snapshot = this.interestSnapshot(cell, true, [], counts),
+      temporaryChannel = `__full:${cell}`;
+    this.unitChannels.delete(temporaryChannel);
+    const wire = compactSnapshot(
+      snapshot,
+      this.unitDelta(temporaryChannel, snapshot.units, true),
+    );
+    this.unitChannels.delete(temporaryChannel);
+    client.sendBytes("state", encode(wire));
+    this.clientInterestCells.set(client.sessionId, cell);
+  }
+  private broadcastInterestStates(
+    changedTiles: string[],
+    counts = this.world.allCounts(),
+  ) {
+    const groups = new Map<string, Client[]>();
+    for (const client of this.clients) {
+      const cell = this.interestCellFor(client.sessionId),
+        clients = groups.get(cell) ?? [];
+      clients.push(client);
+      groups.set(cell, clients);
+    }
+    const activeChannels = new Set<string>();
+    for (const [cell, clients] of groups) {
+      const channelId = `interest:${cell}`;
+      activeChannels.add(channelId);
+      const snapshot = this.interestSnapshot(cell, false, changedTiles, counts),
+        delta = this.unitDelta(channelId, snapshot.units),
+        deltaBytes = encode(compactSnapshot(snapshot, delta));
+      const entrants = clients.filter(
+        (client) => this.clientInterestCells.get(client.sessionId) !== cell,
+      );
+      let fullBytes: Uint8Array | undefined;
+      if (entrants.length) {
+        const fullSnapshot = this.interestSnapshot(cell, true, [], counts),
+          temporaryChannel = `__full:${cell}`;
+        this.unitChannels.delete(temporaryChannel);
+        fullBytes = encode(
+          compactSnapshot(
+            fullSnapshot,
+            this.unitDelta(temporaryChannel, fullSnapshot.units, true),
+          ),
+        );
+        this.unitChannels.delete(temporaryChannel);
+      }
+      for (const client of clients) {
+        client.sendBytes(
+          "state",
+          entrants.includes(client) ? fullBytes! : deltaBytes,
+        );
+        this.clientInterestCells.set(client.sessionId, cell);
+      }
+    }
+    for (const channelId of [...this.unitChannels.keys()])
+      if (channelId.startsWith("interest:") && !activeChannels.has(channelId))
+        this.unitChannels.delete(channelId);
+  }
+  private interestSnapshot(
+    cell: string,
+    full: boolean,
+    tileKeys: string[],
+    counts = this.world.allCounts(),
+  ): Snapshot {
+    const [cellX, cellY] = cell.split(",").map(Number),
+      centerX = (cellX + 0.5) * INTEREST_CELL_SIZE,
+      centerY = (cellY + 0.5) * INTEREST_CELL_SIZE,
+      radius = GAME.map.unitInterestRadius + Math.SQRT2 * INTEREST_CELL_SIZE * 0.5,
+      nearbyUnits = full
+        ? [...this.world.units.values()].filter(
+            (unit) => Math.hypot(unit.x - centerX, unit.y - centerY) <= radius,
+          )
+        : [...this.world.spatial.query(centerX, centerY, radius)].filter(
+            (entity): entity is Unit => "kind" in entity,
+          ),
+      units = nearbyUnits
+        .map((unit) => this.unitView(unit)),
+      allPlayers = [...this.world.players.values()],
+      visibleOwnerIds = new Set(nearbyUnits.map((unit) => unit.ownerId)),
+      nearbyPlayers = allPlayers.filter(
+        (player) =>
+          player.alive &&
+          (visibleOwnerIds.has(player.id) ||
+            Math.hypot(player.x - centerX, player.y - centerY) <= radius),
+      ),
+      leaderboard = allPlayers
+        .map((player) => ({ ...player, ...counts.get(player.id)! }))
+        .sort((a, b) => b.tiles - a.tiles)
+        .map((player) => ({
+          id: player.id,
+          name: player.name,
+          color: player.color,
+          tiles: player.tiles,
+          kills: player.kills,
+        })),
+      tiles: Snapshot["tiles"] = [];
+    if (full) {
+      const minX = Math.max(0, Math.floor(centerX - radius)),
+        maxX = Math.min(GAME.map.width - 1, Math.ceil(centerX + radius)),
+        minY = Math.max(0, Math.floor(centerY - radius)),
+        maxY = Math.min(GAME.map.height - 1, Math.ceil(centerY + radius));
+      for (let y = minY; y <= maxY; y++)
+        for (let x = minX; x <= maxX; x++) {
+          const tile = this.world.map.get(key(x, y));
+          if (!tile) continue;
+          tiles.push([x, y, tile.owner, tile.obstacle ? 1 : 0, tile.supplyDecay]);
+        }
+    } else {
+      for (const tileKey of tileKeys) {
+        const [x, y] = tileKey.split(",").map(Number);
+        if (Math.abs(x + 0.5 - centerX) > radius || Math.abs(y + 0.5 - centerY) > radius)
+          continue;
+        const tile = this.world.map.get(tileKey);
+        if (tile)
+          tiles.push([x, y, tile.owner, tile.obstacle ? 1 : 0, tile.supplyDecay]);
+      }
+    }
+    return {
+      now: Date.now(),
+      endsAt: this.world.endsAt,
+      width: GAME.map.width,
+      height: GAME.map.height,
+      players: nearbyPlayers.map((player) => ({
+        ...player,
+        ...(counts.get(player.id) ?? this.world.counts(player.id)),
+      })),
+      units,
+      tiles,
+      leaderboard,
+      globalUnits: this.world.units.size,
+    };
+  }
+  private unitView(unit: Unit): ServerUnitView {
+    return {
+      id: unit.id,
+      ownerId: unit.ownerId,
+      kind: unit.kind,
+      x: unit.x,
+      y: unit.y,
+      hp: unit.hp,
+      maxHp:
+        unit.kind === "bastion" && unit.bastionType === "wall"
+          ? GAME.units.bastion.wallHp
+          : unit.kind === "bastion" && unit.bastionType === "turret"
+            ? GAME.units.bastion.turretHp
+            : GAME.units[unit.kind].hp,
+      nextProduce: unit.nextProduce,
+      bastionType: unit.bastionType,
+      homeX: unit.homeX,
+      homeY: unit.homeY,
+    };
+  }
   wireSnapshot(
     clientId: string,
     full = false,
@@ -509,7 +667,7 @@ export class DominionRoom extends Room {
       visible.add(unit.id);
       let numericId = channel.ids.get(unit.id);
       if (!numericId) {
-        numericId = channel.nextId++;
+        numericId = this.globalUnitId(unit.id);
         channel.ids.set(unit.id, numericId);
       }
       const x = Math.max(
@@ -591,6 +749,15 @@ export class DominionRoom extends Room {
         channel.ids.delete(unitId);
       }
     return [created, updated, removed, full ? 1 : 0];
+  }
+  private globalUnitId(unitId: string) {
+    this.globalUnitIds ??= new Map();
+    this.nextGlobalUnitId ??= 1;
+    const existing = this.globalUnitIds.get(unitId);
+    if (existing) return existing;
+    const numericId = this.nextGlobalUnitId++;
+    this.globalUnitIds.set(unitId, numericId);
+    return numericId;
   }
   snapshot(
     clientId?: string,

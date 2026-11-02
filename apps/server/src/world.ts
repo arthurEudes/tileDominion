@@ -12,7 +12,7 @@ import {
   type Unit,
 } from "./model.js";
 import { SpatialIndex } from "./spatial.js";
-import type { RustEngine } from "./rust-engine.js";
+import type { RustEngine, RustSimulationEvent } from "./rust-engine.js";
 type CombatKind = "soldier" | "attacker" | "defender";
 const isCombatKind = (kind: Unit["kind"]): kind is CombatKind =>
   kind === "soldier" || kind === "attacker" || kind === "defender";
@@ -35,6 +35,7 @@ export class World {
   readonly spatial = new SpatialIndex(16);
   readonly suppliedTiles = new Uint8Array(GAME.map.width * GAME.map.height);
   readonly wallTiles = new Set<string>();
+  readonly capitals = new Map<string, { x: number; y: number }>();
   endsAt = Date.now() + GAME.room.durationMs;
   private serial = 0;
   private incomeElapsed = 0;
@@ -62,6 +63,7 @@ export class World {
       upgrades: { speed: 0, armor: 0, capture: 0 },
     };
     this.players.set(id, p);
+    this.capitals.set(id, { x: spot.x, y: spot.y });
     this.markPlayer(id);
     this.territoryCounts.set(id, 0);
     for (
@@ -81,46 +83,16 @@ export class World {
           this.setOwner(k, t, id);
         }
       }
-    const headquartersId = `u${++this.serial}`,
-      now = Date.now();
-    this.units.set(headquartersId, {
-      id: headquartersId,
-      ownerId: id,
-      kind: "headquarters",
-      x: spot.x + 0.5,
-      y: spot.y + 0.5,
-      hp: GAME.units.headquarters.hp,
-      dirX: 0,
-      dirY: 0,
-      nextThink: Number.POSITIVE_INFINITY,
-      lastAttack: 0,
-      captureKey: "",
-      captureSince: 0,
-      nextProduce: 0,
-      order: "guard",
-      orderX: spot.x + 0.5,
-      orderY: spot.y + 0.5,
-      nextSimulationAt: now,
-      lastSimulatedAt: now,
-      cachedTargetId: "",
-      cachedTargetUntil: 0,
-    });
-    this.markUnit(headquartersId);
     return p;
   }
   findSpawn() {
     let best = { x: 4, y: 4, score: -1 };
-    const headquarters = [...this.units.values()].filter(
-      (unit) => unit.kind === "headquarters",
-    );
     for (let i = 0; i < 120; i++) {
       const x = 3 + Math.floor(Math.random() * (GAME.map.width - 6)),
         y = 3 + Math.floor(Math.random() * (GAME.map.height - 6));
       let score = 999;
       for (const p of this.players.values())
         score = Math.min(score, Math.hypot(x - p.x, y - p.y));
-      for (const unit of headquarters)
-        score = Math.min(score, Math.hypot(x - unit.x, y - unit.y));
       const t = this.map.get(key(x, y));
       if (t && !t.obstacle && score > best.score) best = { x, y, score };
     }
@@ -150,19 +122,29 @@ export class World {
     return target;
   }
   findNearestNonAlliedTile(x: number, y: number, ownerId: string) {
+    return this.findNearestTiles(x, y, ownerId, false, 1)[0];
+  }
+  private findNearestTiles(
+    x: number,
+    y: number,
+    ownerId: string,
+    allied: boolean,
+    limit: number,
+  ) {
     const centerX = Math.floor(x),
       centerY = Math.floor(y),
       maxRadius = Math.max(GAME.map.width, GAME.map.height);
-    let best: { x: number; y: number; distance: number } | undefined;
+    const best: Array<{ x: number; y: number; distance: number }> = [];
     for (let radius = 0; radius <= maxRadius; radius++) {
       const visit = (tx: number, ty: number) => {
         if (tx < 0 || ty < 0 || tx >= GAME.map.width || ty >= GAME.map.height)
           return;
         const tile = this.map.get(key(tx, ty));
-        if (!tile || tile.obstacle || tile.owner === ownerId) return;
+        if (!tile || tile.obstacle || (tile.owner === ownerId) !== allied) return;
         const distance = Math.hypot(tx + 0.5 - x, ty + 0.5 - y);
-        if (!best || distance < best.distance)
-          best = { x: tx + 0.5, y: ty + 0.5, distance };
+        best.push({ x: tx + 0.5, y: ty + 0.5, distance });
+        best.sort((a, b) => a.distance - b.distance);
+        best.length = Math.min(best.length, limit);
       };
       for (let offset = -radius; offset <= radius; offset++) {
         visit(centerX + offset, centerY - radius);
@@ -172,14 +154,15 @@ export class World {
         visit(centerX - radius, centerY + offset);
         if (radius) visit(centerX + radius, centerY + offset);
       }
-      if (best && best.distance <= radius) return best;
+      if (best.length === limit && best[best.length - 1].distance <= radius)
+        return best;
     }
     return best;
   }
   setInput(id: string, input: Input) {
     const p = this.players.get(id);
     if (p && input.seq > p.input.seq)
-      p.input = { ...input, attack: !!input.attack };
+      p.input = { ...input, attack: false };
   }
   buy(id: string, item: BuyItem) {
     const p = this.players.get(id);
@@ -416,7 +399,9 @@ export class World {
       unitRemovals = [...this.rustRemovedUnits],
       playerChanges = [...this.rustDirtyPlayers],
       playerRemovals = [...this.rustRemovedPlayers];
-    const schedules = await engine.scheduleDelta(
+    const usesEventJournal = typeof engine.scheduleDeltaWithEvents === "function";
+    const tickResult = usesEventJournal
+      ? await engine.scheduleDeltaWithEvents(
       now,
       unitChanges.flatMap(([id]) => {
         const unit = this.units.get(id);
@@ -430,7 +415,26 @@ export class World {
       playerRemovals.map(([id]) => id),
       this.map,
       rustTileChanges,
-    );
+        )
+      : {
+          schedules: await engine.scheduleDelta(
+            now,
+            unitChanges.flatMap(([id]) => {
+              const unit = this.units.get(id);
+              return unit ? [unit] : [];
+            }),
+            unitRemovals.map(([id]) => id),
+            playerChanges.flatMap(([id]) => {
+              const player = this.players.get(id);
+              return player ? [player] : [];
+            }),
+            playerRemovals.map(([id]) => id),
+            this.map,
+            rustTileChanges,
+          ),
+          events: [],
+        };
+    const { schedules, events } = tickResult;
     for (const tileKey of rustTileChanges) this.rustDirtyTiles.delete(tileKey);
     this.ackVersions(this.rustDirtyUnits, unitChanges);
     this.ackVersions(this.rustRemovedUnits, unitRemovals);
@@ -451,17 +455,28 @@ export class World {
       u.dirX = schedule.dir_x;
       u.dirY = schedule.dir_y;
       u.nextThink = schedule.next_think;
+      u.lastAttack = schedule.last_attack;
       u.cachedTargetId = schedule.target_id ?? "";
       u.cachedTargetUntil = schedule.target_id
         ? now + GAME.simulation.targetCacheMs
         : now + GAME.simulation.intermediateIntervalMs;
-      this.applyRustUnitEffects(u, now);
+      if (usesEventJournal) this.applyRustStructureEffects(u, now);
+      else this.applyRustUnitEffectsLegacy(u, now);
       this.enforceUnitBounds(u);
     }
+    for (const event of events) this.applyRustEvent(event);
     this.updateSupply(now);
     this.applyIncome(dt);
   }
-  private applyRustUnitEffects(u: Unit, now: number) {
+  private applyRustStructureEffects(u: Unit, now: number) {
+    if (u.ownerId === NEUTRAL_OWNER_ID) return;
+    if (!this.players.has(u.ownerId)) {
+      this.removeUnit(u.id);
+      return;
+    }
+    if (u.kind === "headquarters") return;
+  }
+  private applyRustUnitEffectsLegacy(u: Unit, now: number) {
     if (u.ownerId === NEUTRAL_OWNER_ID) return;
     if (!this.players.has(u.ownerId)) {
       this.removeUnit(u.id);
@@ -480,9 +495,7 @@ export class World {
           u.captureKey = tileKey;
           u.captureSince = now;
         }
-        const duration =
-          GAME.capture.holdMs *
-          GAME.capture.robotMultiplier *
+        const duration = GAME.capture.holdMs * GAME.capture.robotMultiplier *
           (tile.owner ? GAME.capture.enemyMultiplier : 1);
         if (now - u.captureSince >= duration) {
           this.setOwner(tileKey, tile, u.ownerId);
@@ -491,29 +504,60 @@ export class World {
       } else u.captureKey = "";
       return;
     }
-    if (isCombatKind(u.kind) && u.cachedTargetId) {
-      const cfg = combatConfig(u.kind);
-      const target =
-        this.units.get(u.cachedTargetId) ??
-        this.players.get(u.cachedTargetId);
-      if (
-        !target ||
-        target.id === u.id ||
-        dist(u, target) > cfg.range ||
-        now - u.lastAttack < cfg.cooldownMs
-      )
+    if (!isCombatKind(u.kind) || !u.cachedTargetId) return;
+    const cfg = combatConfig(u.kind),
+      target = this.units.get(u.cachedTargetId) ?? this.players.get(u.cachedTargetId);
+    if (!target || target.id === u.id || dist(u, target) > cfg.range ||
+        now - u.lastAttack < cfg.cooldownMs) return;
+    const valid = "kind" in target
+      ? target.ownerId !== u.ownerId
+      : target.id !== u.ownerId && target.alive && now >= target.invulnerableUntil;
+    if (!valid) return;
+    u.lastAttack = now;
+    if ("kind" in target) this.damageUnit(target, cfg.damage);
+    else this.damagePlayer(target, cfg.damage, u.ownerId);
+  }
+  private applyRustEvent(event: RustSimulationEvent) {
+    if (event.kind === 0) {
+      if (!event.ownerId) return;
+      const x = event.tileIndex % GAME.map.width,
+        y = Math.floor(event.tileIndex / GAME.map.width),
+        tileKey = key(x, y),
+        tile = this.map.get(tileKey);
+      if (tile && !tile.obstacle && tile.owner !== event.ownerId)
+        this.setOwner(tileKey, tile, event.ownerId);
+      return;
+    }
+    if (event.kind === 2) {
+      if (!event.entityId || !event.ownerId) return;
+      const source = this.units.get(event.entityId);
+      if (!source || source.ownerId !== event.ownerId || source.kind !== "bastion")
         return;
-      const valid =
-        "kind" in target
-          ? target.ownerId !== u.ownerId
-          : target.id !== u.ownerId &&
-            target.alive &&
-            now >= target.invulnerableUntil;
-      if (!valid) return;
-      u.lastAttack = now;
-      if ("kind" in target)
-        this.damageUnit(target, cfg.damage);
-      else this.damagePlayer(target, cfg.damage, u.ownerId);
+      const kind = event.tileIndex === 0 ? "robot" : "defender";
+      this.spawnProducedUnit(event.ownerId, kind, source.x, source.y, source.id);
+      source.nextProduce = Date.now() + Math.max(0, event.amount);
+      this.markUnit(source.id);
+      return;
+    }
+    if (event.kind === 3) {
+      if (event.targetId && this.units.has(event.targetId))
+        this.removeUnit(event.targetId);
+      return;
+    }
+    if (event.kind !== 1 || !event.targetId || !event.ownerId) return;
+    const target = this.units.get(event.targetId) ?? this.players.get(event.targetId);
+    if (!target || !Number.isFinite(event.amount) || event.amount <= 0) return;
+    if ("kind" in target) {
+      if (target.ownerId !== event.ownerId) {
+        target.hp -= event.amount;
+        this.markUnit(target.id);
+      }
+    } else if (
+      target.id !== event.ownerId &&
+      target.alive &&
+      Date.now() >= target.invulnerableUntil
+    ) {
+      this.damagePlayer(target, event.amount, event.ownerId);
     }
   }
   private applyIncome(dt: number) {
@@ -522,16 +566,13 @@ export class World {
       this.incomeElapsed %= GAME.economy.incomeIntervalMs;
       for (const p of this.players.values())
         if (p.alive) {
-          const hasHeadquarters = [...this.units.values()].some(
-            (u) => u.ownerId === p.id && u.kind === "headquarters",
-          );
           p.money +=
             Math.floor(
               ((this.suppliedTerritoryCounts.get(p.id) ?? 0) +
                 (this.unsuppliedTerritoryCounts.get(p.id) ?? 0) *
                   GAME.supply.unsuppliedIncomeMultiplier) *
                 GAME.economy.incomePerTile,
-            ) + (hasHeadquarters ? GAME.economy.headquartersIncome : 0);
+            );
         }
     }
   }
@@ -588,27 +629,6 @@ export class World {
         p.captureKey = "";
       }
     } else p.captureKey = "";
-    if (p.input.attack && now - p.lastAttack >= GAME.player.attackCooldownMs) {
-      p.lastAttack = now;
-      const nearby = [...this.spatial.query(p.x, p.y, GAME.player.attackRange)];
-      const targets = nearby
-        .filter(
-          (e): e is Player =>
-            !("kind" in e) &&
-            e.id !== p.id &&
-            e.alive &&
-            now >= e.invulnerableUntil,
-        )
-        .sort((a, b) => dist(p, a) - dist(p, b));
-      if (targets[0])
-        this.damagePlayer(targets[0], GAME.player.attackDamage, p.id);
-      else {
-        const u = nearby.find(
-          (e): e is Unit => "kind" in e && e.ownerId !== p.id,
-        );
-        if (u) this.damageUnit(u, GAME.player.attackDamage);
-      }
-    }
   }
   tickUnit(u: Unit, dt: number, now: number) {
     if (u.ownerId === NEUTRAL_OWNER_ID) return;
@@ -651,7 +671,8 @@ export class World {
         key(Math.floor(u.orderX), Math.floor(u.orderY)),
       );
       if (now >= u.nextThink || !targetTile || targetTile.owner === u.ownerId) {
-        const target = this.findNearestNonAlliedTile(u.x, u.y, u.ownerId);
+        const candidates = this.findNearestTiles(u.x, u.y, u.ownerId, false, 3),
+          target = candidates[Math.floor(Math.random() * candidates.length)];
         if (target) {
           u.orderX = target.x;
           u.orderY = target.y;
@@ -665,7 +686,18 @@ export class World {
         directed = true;
       }
     }
-    if (isCombatKind(u.kind)) {
+    const defenderStartedAllied = u.kind === "defender" &&
+      this.map.get(key(Math.floor(u.x), Math.floor(u.y)))?.owner === u.ownerId;
+    if (u.kind === "defender" && !defenderStartedAllied) {
+      const target = this.findNearestTiles(u.x, u.y, u.ownerId, true, 1)[0];
+      if (target) {
+        const distance = Math.hypot(target.x - u.x, target.y - u.y) || 1;
+        u.dirX = (target.x - u.x) / distance;
+        u.dirY = (target.y - u.y) / distance;
+        directed = true;
+      }
+    }
+    if (isCombatKind(u.kind) && !(u.kind === "defender" && !defenderStartedAllied)) {
       const cfg = combatConfig(u.kind);
       let target: Unit | Player | undefined;
       if (
@@ -680,11 +712,6 @@ export class World {
           target.id !== u.id &&
           (u.kind === "attacker" ||
             dist(u, target) <= cfg.detectionRange * 1.25) &&
-          (u.kind !== "defender" ||
-            Math.hypot(
-              target.x - (u.homeX ?? u.orderX),
-              target.y - (u.homeY ?? u.orderY),
-            ) <= GAME.units.defender.guardRadius) &&
           ("kind" in target
             ? target.ownerId !== u.ownerId
             : target.id !== u.ownerId &&
@@ -702,12 +729,7 @@ export class World {
                 "kind" in e &&
                 e.id !== u.id &&
                 e.ownerId !== u.ownerId &&
-                dist(u, e) <= cfg.detectionRange &&
-                (u.kind !== "defender" ||
-                  Math.hypot(
-                    e.x - (u.homeX ?? u.orderX),
-                    e.y - (u.homeY ?? u.orderY),
-                  ) <= GAME.units.defender.guardRadius),
+                dist(u, e) <= cfg.detectionRange,
             )
             .sort(
               (a, b) =>
@@ -723,12 +745,7 @@ export class World {
                 p.id !== u.ownerId &&
                 p.alive &&
                 now >= p.invulnerableUntil &&
-                dist(u, p) <= cfg.detectionRange &&
-                (u.kind !== "defender" ||
-                  Math.hypot(
-                    p.x - (u.homeX ?? u.orderX),
-                    p.y - (u.homeY ?? u.orderY),
-                  ) <= GAME.units.defender.guardRadius),
+                dist(u, p) <= cfg.detectionRange,
             )
             .sort((a, b) => dist(u, a) - dist(u, b));
         target = enemyUnits[0] ?? enemyPlayers[0];
@@ -757,29 +774,6 @@ export class World {
         }
       }
       if (!target) {
-        if (u.kind === "defender" && u.order === "guard") {
-          const centerX = u.homeX ?? u.orderX,
-            centerY = u.homeY ?? u.orderY,
-            radius = GAME.units.defender.guardRadius,
-            dx = centerX - u.x,
-            dy = centerY - u.y,
-            distance = Math.hypot(dx, dy);
-          if (distance > radius * 0.82) {
-            u.dirX = dx / (distance || 1);
-            u.dirY = dy / (distance || 1);
-            u.nextThink = now + 350;
-          } else if (now >= u.nextThink) {
-            const inwardAngle = Math.atan2(dy, dx),
-              angle =
-                distance > radius * 0.6
-                  ? inwardAngle + (Math.random() - 0.5) * Math.PI
-                  : Math.random() * Math.PI * 2;
-            u.dirX = Math.cos(angle);
-            u.dirY = Math.sin(angle);
-            u.nextThink = now + 900 + Math.random() * 1200;
-          }
-          directed = true;
-        }
         const destination =
           u.order === "follow"
             ? { x: owner.x, y: owner.y, radius: 2.2 }
@@ -816,24 +810,9 @@ export class World {
       u.dirY = Math.sin(a);
     }
     const cfg = GAME.units[u.kind];
-    this.moveMobileUnit(u, cfg.speed, dt);
-    if (u.kind === "defender" && u.order === "guard") {
-      const centerX = u.homeX ?? u.orderX,
-        centerY = u.homeY ?? u.orderY,
-        dx = u.x - centerX,
-        dy = u.y - centerY,
-        distance = Math.hypot(dx, dy),
-        limit = GAME.units.defender.guardRadius * 0.96;
-      if (distance > limit) {
-        u.x = centerX + (dx / distance) * limit;
-        u.y = centerY + (dy / distance) * limit;
-        u.dirX = -dx / distance;
-        u.dirY = -dy / distance;
-        u.nextThink = now + 350;
-      }
-    }
+    this.moveMobileUnit(u, cfg.speed, dt, defenderStartedAllied);
   }
-  moveMobileUnit(u: Unit, speed: number, dt: number) {
+  moveMobileUnit(u: Unit, speed: number, dt: number, stayOnAlliedTerritory = false) {
     if (!dt || (!u.dirX && !u.dirY)) return;
     const base = Math.atan2(u.dirY, u.dirX),
       offsets = [0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2];
@@ -843,7 +822,11 @@ export class World {
         dy = Math.sin(angle),
         nx = clamp(u.x + dx * speed * dt, 0.1, GAME.map.width - 0.1),
         ny = clamp(u.y + dy * speed * dt, 0.1, GAME.map.height - 0.1);
-      if (this.isMovementBlocked(nx, ny)) continue;
+      if (
+        this.isMovementBlocked(nx, ny) ||
+        (stayOnAlliedTerritory &&
+          this.map.get(key(Math.floor(nx), Math.floor(ny)))?.owner !== u.ownerId)
+      ) continue;
       u.x = nx;
       u.y = ny;
       u.dirX = dx;
@@ -870,37 +853,13 @@ export class World {
   }
   die(p: Player) {
     p.hp = 0;
-    const headquarters = [...this.units.values()].find(
-      (u) => u.ownerId === p.id && u.kind === "headquarters",
-    );
-    if (headquarters) {
-      p.x = headquarters.x;
-      p.y = headquarters.y;
-      p.hp = p.maxHp;
-      p.invulnerableUntil = Date.now() + GAME.player.respawnInvulnerabilityMs;
-      return;
-    }
-    const owned = [...this.map.entries()].filter(([, t]) => t.owner === p.id);
-    if (!owned.length) {
+    const respawn = this.safestOwnedTile(p.id, true) ?? this.safestOwnedTile(p.id);
+    if (!respawn) {
       p.alive = false;
       return;
     }
-    let best = owned[0][0],
-      score = -1;
-    for (const [k] of owned) {
-      const [x, y] = k.split(",").map(Number);
-      let nearest = 999;
-      for (const e of this.players.values())
-        if (e.id !== p.id && e.alive)
-          nearest = Math.min(nearest, Math.hypot(x - e.x, y - e.y));
-      if (nearest > score) {
-        score = nearest;
-        best = k;
-      }
-    }
-    const [x, y] = best.split(",").map(Number);
-    p.x = x + 0.5;
-    p.y = y + 0.5;
+    p.x = respawn.x + 0.5;
+    p.y = respawn.y + 0.5;
     p.hp = p.maxHp;
     p.invulnerableUntil = Date.now() + GAME.player.respawnInvulnerabilityMs;
   }
@@ -977,13 +936,16 @@ export class World {
     if (now - this.lastSupplyUpdate < GAME.supply.updateIntervalMs) return;
     this.lastSupplyUpdate = now;
     this.suppliedTiles.fill(0);
-    for (const source of this.units.values()) {
-      const radius =
-        source.kind === "headquarters"
-          ? GAME.supply.headquartersRadius
-          : source.kind === "bastion" && source.bastionType === "relay"
-            ? GAME.supply.relayRadius
-            : 0;
+    const sources = [
+      ...[...this.capitals.entries()]
+        .filter(([ownerId]) => this.players.get(ownerId)?.alive)
+        .map(([ownerId, capital]) => ({ ...capital, ownerId, supplyRadius: GAME.supply.headquartersRadius })),
+      ...[...this.units.values()]
+        .filter((unit) => unit.kind === "bastion" && unit.bastionType === "relay")
+        .map((unit) => ({ ...unit, supplyRadius: GAME.supply.relayRadius })),
+    ];
+    for (const source of sources) {
+      const radius = source.supplyRadius;
       if (!radius) continue;
       const minX = Math.max(0, Math.floor(source.x - radius)),
         maxX = Math.min(GAME.map.width - 1, Math.floor(source.x + radius)),
@@ -1060,10 +1022,11 @@ export class World {
   }
   setOwner(k: string, t: Tile, owner: string | null) {
     if (t.owner === owner) return;
-    if (t.owner)
+    const previousOwner = t.owner;
+    if (previousOwner)
       this.territoryCounts.set(
-        t.owner,
-        Math.max(0, (this.territoryCounts.get(t.owner) ?? 0) - 1),
+        previousOwner,
+        Math.max(0, (this.territoryCounts.get(previousOwner) ?? 0) - 1),
       );
     t.owner = owner;
     t.unsuppliedSince = 0;
@@ -1075,6 +1038,38 @@ export class World {
       );
     this.dirtyTiles.add(k);
     this.rustDirtyTiles.add(k);
+    const previousCapital = previousOwner && this.capitals.get(previousOwner);
+    if (previousCapital && key(previousCapital.x, previousCapital.y) === k)
+      this.relocateCapital(previousOwner);
+  }
+  private relocateCapital(ownerId: string) {
+    const replacement = this.safestOwnedTile(ownerId, true) ?? this.safestOwnedTile(ownerId);
+    if (replacement) this.capitals.set(ownerId, replacement);
+    else this.capitals.delete(ownerId);
+  }
+  private safestOwnedTile(ownerId: string, suppliedOnly = false) {
+    const capital = this.capitals.get(ownerId);
+    let best: { x: number; y: number } | undefined,
+      bestScore = -1;
+    for (let y = 0; y < GAME.map.height; y++)
+      for (let x = 0; x < GAME.map.width; x++) {
+        const tile = this.map.get(key(x, y));
+        if (!tile || tile.owner !== ownerId || tile.obstacle) continue;
+        const supplied = this.isTileSupplied(x, y) || (capital?.x === x && capital.y === y);
+        if (suppliedOnly && !supplied) continue;
+        let nearestEnemy = Number.POSITIVE_INFINITY;
+        for (const player of this.players.values())
+          if (player.id !== ownerId && player.alive)
+            nearestEnemy = Math.min(
+              nearestEnemy,
+              Math.hypot(x + 0.5 - player.x, y + 0.5 - player.y),
+            );
+        if (nearestEnemy > bestScore) {
+          bestScore = nearestEnemy;
+          best = { x, y };
+        }
+      }
+    return best;
   }
   counts(id: string) {
     return this.allCounts().get(id) ?? {
@@ -1124,12 +1119,13 @@ export class World {
     if (!player) return false;
     player.isBot = true;
     player.name = name;
-    player.input = { x: 0, y: 0, attack: true, seq: player.input.seq + 1 };
+    player.input = { x: 0, y: 0, attack: false, seq: player.input.seq + 1 };
     this.markPlayer(id);
     return true;
   }
   neutralizePlayer(id: string) {
     const neutralizedUnits: string[] = [];
+    this.capitals.delete(id);
     for (const [tileKey, tile] of this.map)
       if (tile.owner === id) this.setOwner(tileKey, tile, null);
     for (const unit of this.units.values())
@@ -1154,6 +1150,7 @@ export class World {
   }
   removePlayer(id: string) {
     if (!this.players.delete(id)) return;
+    this.capitals.delete(id);
     this.rustDirtyPlayers.delete(id);
     this.rustRemovedPlayers.set(id, ++this.rustVersion);
   }

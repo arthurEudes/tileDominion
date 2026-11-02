@@ -4,7 +4,8 @@ import { decode, encode } from "@msgpack/msgpack";
 import { GAME } from "@tile/game-config";
 import type { Player, Unit } from "./model.js";
 
-export const RUST_PROTOCOL_VERSION = 2;
+export const RUST_PROTOCOL_VERSION = 3;
+const DEFAULT_REQUEST_TIMEOUT_MS = 100;
 
 export function rustExecutablePath(platform = process.platform) {
   const filename = `tile-dominion-simulation${platform === "win32" ? ".exe" : ""}`;
@@ -24,6 +25,7 @@ export type RustSchedule = {
   dir_x: number;
   dir_y: number;
   next_think: number;
+  last_attack: number;
 };
 
 export type RustMetrics = {
@@ -33,14 +35,39 @@ export type RustMetrics = {
   movement_us: number;
 };
 
+export type RustSimulationEvent = {
+  kind: number;
+  entityId: string | null;
+  targetId: string | null;
+  tileIndex: number;
+  amount: number;
+  ownerId: string | null;
+};
+
+export type RustTickResult = {
+  schedules: RustSchedule[];
+  events: RustSimulationEvent[];
+};
+
+export type RustTransportMetrics = {
+  inFlight: number;
+  peakInFlight: number;
+  completed: number;
+  timedOut: number;
+  orphanedResponses: number;
+  lastRoundTripMs: number;
+};
+
 type TileMap = ReadonlyMap<string, { obstacle: boolean; owner: string | null }>;
 
 export class RustEngine {
   private child: ChildProcessWithoutNullStreams;
-  private pending: Array<{
-    resolve: (value: RustSchedule[]) => void;
+  private pending = new Map<number, {
+    resolve: (value: RustTickResult) => void;
     reject: (error: Error) => void;
-  }> = [];
+    timeout: NodeJS.Timeout;
+    startedAt: number;
+  }>();
   private startError?: Error;
   private output = Buffer.alloc(0);
   private closed = false;
@@ -50,6 +77,15 @@ export class RustEngine {
   private stringIds = new Map<number, string>();
   private legacyUnits = new Set<string>();
   private legacyHumans = new Set<string>();
+  private nextRequestId = 1;
+  readonly transportMetrics: RustTransportMetrics = {
+    inFlight: 0,
+    peakInFlight: 0,
+    completed: 0,
+    timedOut: 0,
+    orphanedResponses: 0,
+    lastRoundTripMs: 0,
+  };
   lastMetrics?: RustMetrics;
 
   constructor() {
@@ -63,16 +99,27 @@ export class RustEngine {
         if (this.output.length < length + 4) return;
         const frame = this.output.subarray(4, length + 4);
         this.output = this.output.subarray(length + 4);
-        const pending = this.pending.shift();
-        if (!pending) continue;
         try {
-          const [wireSchedules, wireMetrics] = decode(frame) as [
+          const [requestId, wireSchedules, wireMetrics, , wireEvents] = decode(frame) as [
+            number,
             Array<[
               number, number, number, number | null, number,
-              number, number, number, number, number,
+              number, number, number, number, number, number,
             ]>,
             [number, number, number, number] | null,
+            number,
+            Array<[number, number, number, number, number, number]>,
           ];
+          const pending = this.pending.get(requestId);
+          if (!pending) {
+            this.transportMetrics.orphanedResponses++;
+            continue;
+          }
+          this.pending.delete(requestId);
+          clearTimeout(pending.timeout);
+          this.updateInFlight();
+          this.transportMetrics.completed++;
+          this.transportMetrics.lastRoundTripMs = Date.now() - pending.startedAt;
           this.lastMetrics = wireMetrics
             ? {
                 decode_us: wireMetrics[0],
@@ -81,8 +128,8 @@ export class RustEngine {
                 movement_us: wireMetrics[3],
               }
             : undefined;
-          pending.resolve(
-            wireSchedules.map((schedule) => ({
+          pending.resolve({
+            schedules: wireSchedules.map((schedule) => ({
               id: this.stringIds.get(schedule[0])!,
               dt: schedule[1],
               interval_ms: schedule[2],
@@ -96,22 +143,31 @@ export class RustEngine {
               dir_x: schedule[7],
               dir_y: schedule[8],
               next_think: schedule[9],
+              last_attack: schedule[10],
             })),
-          );
+            events: (wireEvents ?? []).map((event) => ({
+              kind: event[0],
+              entityId: this.stringIds.get(event[1]) ?? null,
+              targetId: this.stringIds.get(event[2]) ?? null,
+              tileIndex: event[3],
+              amount: event[4],
+              ownerId: this.stringIds.get(event[5]) ?? null,
+            })),
+          });
         } catch (error) {
-          pending.reject(error as Error);
+          this.failAll(error as Error);
         }
       }
     });
     this.child.on("exit", (code) => {
       this.closed = true;
       const error = new Error(`Le moteur Rust s'est arrêté (${code ?? "inconnu"})`);
-      for (const pending of this.pending.splice(0)) pending.reject(error);
+      this.failAll(error);
     });
     this.child.on("error", (error) => {
       this.closed = true;
       this.startError = error;
-      for (const pending of this.pending.splice(0)) pending.reject(error);
+      this.failAll(error);
     });
     this.child.stderr.on("data", (chunk: Buffer) => {
       console.error(`Moteur Rust: ${chunk.toString().trimEnd()}`);
@@ -155,6 +211,20 @@ export class RustEngine {
     map?: TileMap,
     dirtyTiles: Iterable<string> = [],
   ) {
+    return this.scheduleDeltaWithEvents(
+      now, unitUpserts, unitRemovals, humanUpserts, humanRemovals, map, dirtyTiles,
+    ).then(({ schedules }) => schedules);
+  }
+
+  scheduleDeltaWithEvents(
+    now: number,
+    unitUpserts: Iterable<Unit>,
+    unitRemovals: Iterable<string>,
+    humanUpserts: Iterable<Player>,
+    humanRemovals: Iterable<string>,
+    map?: TileMap,
+    dirtyTiles: Iterable<string> = [],
+  ) {
     const removedUnitIds = [...unitRemovals],
       removedHumanIds = [...humanRemovals];
     const mapInit =
@@ -189,8 +259,10 @@ export class RustEngine {
               : [];
           })
         : [];
+    const requestId = this.allocateRequestId();
     const request = [
       RUST_PROTOCOL_VERSION,
+      requestId,
       now,
       GAME.units.soldier.detectionRange,
       GAME.simulation.intermediateRadius,
@@ -207,6 +279,23 @@ export class RustEngine {
         GAME.simulation.targetCacheMs,
         GAME.simulation.tickBudgetMs * 1000,
         GAME.units.defender.guardRadius,
+        GAME.capture.holdMs * GAME.capture.robotMultiplier,
+        GAME.capture.enemyMultiplier,
+        GAME.units.soldier.damage,
+        GAME.units.attacker.damage,
+        GAME.units.defender.damage,
+        GAME.units.soldier.range,
+        GAME.units.attacker.range,
+        GAME.units.defender.range,
+        GAME.units.soldier.cooldownMs,
+        GAME.units.attacker.cooldownMs,
+        GAME.units.defender.cooldownMs,
+        GAME.units.bastion.fortressProductionMs,
+        GAME.units.bastion.factoryProductionMs,
+        GAME.units.bastion.maxDefenders,
+        GAME.units.bastion.turretDamage,
+        GAME.units.bastion.turretRange,
+        GAME.units.bastion.turretCooldownMs,
       ],
       [...unitUpserts].map((unit) => this.unitTuple(unit)),
       removedUnitIds.map((id) => this.idFor(id)),
@@ -216,9 +305,9 @@ export class RustEngine {
       tileUpserts,
     ];
     if (map) this.mapInitialized = true;
-    return this.send(request).then((schedules) => {
+    return this.send(requestId, request).then((result) => {
       for (const id of removedUnitIds) this.forgetId(id);
-      return schedules;
+      return result;
     });
   }
 
@@ -230,23 +319,55 @@ export class RustEngine {
     this.mapInitialized = false;
   }
 
-  private send(request: unknown) {
-    return new Promise<RustSchedule[]>((resolve, reject) => {
+  private send(requestId: number, request: unknown) {
+    return new Promise<RustTickResult>((resolve, reject) => {
       if (this.startError || this.closed) {
         reject(this.startError ?? new Error("Le moteur Rust est arrêté"));
         return;
       }
-      this.pending.push({ resolve, reject });
+      const timeout = setTimeout(() => {
+        if (!this.pending.delete(requestId)) return;
+        this.transportMetrics.timedOut++;
+        this.updateInFlight();
+        reject(new Error(`Délai Rust dépassé pour la requête ${requestId}`));
+      }, DEFAULT_REQUEST_TIMEOUT_MS);
+      this.pending.set(requestId, { resolve, reject, timeout, startedAt: Date.now() });
+      this.updateInFlight();
       const payload = Buffer.from(encode(request)),
         header = Buffer.allocUnsafe(4);
       header.writeUInt32LE(payload.length);
       this.child.stdin.write(Buffer.concat([header, payload]), (error) => {
         if (!error) return;
-        const index = this.pending.findIndex((entry) => entry.reject === reject);
-        if (index >= 0) this.pending.splice(index, 1);
+        const pending = this.pending.get(requestId);
+        if (pending) clearTimeout(pending.timeout);
+        this.pending.delete(requestId);
+        this.updateInFlight();
         reject(error);
       });
     });
+  }
+
+  private allocateRequestId() {
+    const id = this.nextRequestId;
+    this.nextRequestId = this.nextRequestId >= 0xffff_ffff ? 1 : this.nextRequestId + 1;
+    return id;
+  }
+
+  private updateInFlight() {
+    this.transportMetrics.inFlight = this.pending.size;
+    this.transportMetrics.peakInFlight = Math.max(
+      this.transportMetrics.peakInFlight,
+      this.pending.size,
+    );
+  }
+
+  private failAll(error: Error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.updateInFlight();
   }
 
   private unitTuple(unit: Unit) {
@@ -261,6 +382,22 @@ export class RustEngine {
       unit.cachedTargetId ? this.idFor(unit.cachedTargetId) : null,
       unit.cachedTargetUntil,
       unit.kind === "bastion" && unit.bastionType === "wall",
+      unit.lastAttack ?? 0,
+      unit.captureKey ? this.tileIndex(unit.captureKey) : null,
+      unit.captureSince ?? 0,
+      unit.bastionType === "fortress"
+        ? 1
+        : unit.bastionType === "factory"
+          ? 2
+          : unit.bastionType === "relay"
+            ? 3
+            : unit.bastionType === "wall"
+              ? 4
+              : unit.bastionType === "turret"
+                ? 5
+                : 0,
+      unit.nextProduce ?? 0,
+      unit.sourceBastionId ? this.idFor(unit.sourceBastionId) : null,
     ];
   }
 

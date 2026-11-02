@@ -67,11 +67,8 @@ describe("strategic bot lifecycle", () => {
     room.botThink.set(bot.id, 0);
     room.botBuildThink.set(bot.id, 0);
     bot.money = 100_000;
-    const enemyHeadquarters = [...room.world.units.values()].find(
-      (unit) => unit.ownerId === enemy.id && unit.kind === "headquarters",
-    )!;
-    enemyHeadquarters.x = bot.x + 5;
-    enemyHeadquarters.y = bot.y;
+    enemy.x = bot.x + 5;
+    enemy.y = bot.y;
 
     for (let turn = 0; turn < 22; turn++) {
       if (turn === 1) room.world.suppliedTiles.fill(1);
