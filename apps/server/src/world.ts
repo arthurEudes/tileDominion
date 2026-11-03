@@ -17,6 +17,15 @@ type CombatKind = "soldier" | "attacker" | "defender";
 const isCombatKind = (kind: Unit["kind"]): kind is CombatKind =>
   kind === "soldier" || kind === "attacker" || kind === "defender";
 const combatConfig = (kind: CombatKind) => GAME.units[kind];
+type UnitCounts = Record<Unit["kind"], number>;
+const emptyUnitCounts = (): UnitCounts => ({
+  robot: 0,
+  soldier: 0,
+  attacker: 0,
+  defender: 0,
+  bastion: 0,
+  headquarters: 0,
+});
 export const NEUTRAL_OWNER_ID = "neutral";
 export class World {
   readonly map = makeMap();
@@ -29,7 +38,9 @@ export class World {
   readonly rustRemovedUnits = new Map<string, number>();
   readonly rustDirtyPlayers = new Map<string, number>();
   readonly rustRemovedPlayers = new Map<string, number>();
+  readonly networkRemovedUnits = new Set<string>();
   readonly territoryCounts = new Map<string, number>();
+  readonly unitCounts = new Map<string, UnitCounts>();
   readonly suppliedTerritoryCounts = new Map<string, number>();
   readonly unsuppliedTerritoryCounts = new Map<string, number>();
   readonly spatial = new SpatialIndex(16);
@@ -66,6 +77,7 @@ export class World {
     this.capitals.set(id, { x: spot.x, y: spot.y });
     this.markPlayer(id);
     this.territoryCounts.set(id, 0);
+    this.unitCounts.set(id, emptyUnitCounts());
     for (
       let y = spot.y - GAME.map.spawnRadius;
       y <= spot.y + GAME.map.spawnRadius;
@@ -182,9 +194,7 @@ export class World {
     const price = cfg.price ?? cfg.basePrice * (level + 1);
     if (p.money < price) return false;
     if (isUnitPurchase) {
-      const count = [...this.units.values()].filter(
-        (u) => u.ownerId === id && u.kind === item,
-      ).length;
+      const count = this.unitCount(id, item);
       if (count >= cfg.max) return false;
       const unitId = `u${++this.serial}`;
       this.units.set(unitId, {
@@ -211,6 +221,7 @@ export class World {
         homeX: item === "defender" ? p.x : undefined,
         homeY: item === "defender" ? p.y : undefined,
       });
+      this.adjustUnitCount(id, item, 1);
       this.markUnit(unitId);
     } else {
       if (level >= cfg.max) return false;
@@ -301,6 +312,7 @@ export class World {
       cachedTargetUntil: 0,
       bastionType,
     });
+    this.adjustUnitCount(id, "bastion", 1);
     if (bastionType === "wall") this.wallTiles.add(tileKey);
     this.markUnit(unitId);
     p.money -= price;
@@ -376,6 +388,7 @@ export class World {
       homeY: kind === "defender" ? y : undefined,
       sourceBastionId,
     });
+    this.adjustUnitCount(ownerId, kind, 1);
     this.markUnit(unitId);
   }
   tick(dt: number, now = Date.now()) {
@@ -392,6 +405,9 @@ export class World {
     }
     this.updateSupply(now);
     this.applyIncome(dt);
+    // Unit movement changes spatial buckets. Interest queries run after the
+    // tick, so the published index must represent the resulting positions.
+    this.spatial.rebuild(this.players.values(), this.units.values());
   }
   async tickWithRust(engine: RustEngine, dt: number, now = Date.now()) {
     const rustTileChanges = [...this.rustDirtyTiles];
@@ -442,7 +458,6 @@ export class World {
     this.ackVersions(this.rustRemovedPlayers, playerRemovals);
     // Keep the operation transactional until the subprocess has answered so
     // the caller can run exactly one fallback tick after a Rust failure.
-    this.spatial.rebuild(this.players.values(), this.units.values());
     for (const p of this.players.values()) this.tickPlayer(p, dt, now);
     for (const p of this.players.values()) this.markPlayer(p.id);
     for (const schedule of schedules) {
@@ -465,6 +480,7 @@ export class World {
       this.enforceUnitBounds(u);
     }
     for (const event of events) this.applyRustEvent(event);
+    this.spatial.rebuild(this.players.values(), this.units.values());
     this.updateSupply(now);
     this.applyIncome(dt);
   }
@@ -687,17 +703,12 @@ export class World {
       }
     }
     const defenderStartedAllied = u.kind === "defender" &&
-      this.map.get(key(Math.floor(u.x), Math.floor(u.y)))?.owner === u.ownerId;
-    if (u.kind === "defender" && !defenderStartedAllied) {
-      const target = this.findNearestTiles(u.x, u.y, u.ownerId, true, 1)[0];
-      if (target) {
-        const distance = Math.hypot(target.x - u.x, target.y - u.y) || 1;
-        u.dirX = (target.x - u.x) / distance;
-        u.dirY = (target.y - u.y) / distance;
-        directed = true;
-      }
-    }
-    if (isCombatKind(u.kind) && !(u.kind === "defender" && !defenderStartedAllied)) {
+      this.map.get(key(Math.floor(u.x), Math.floor(u.y)))?.owner === u.ownerId,
+      defenderReturnTarget = u.kind === "defender" && !defenderStartedAllied
+        ? this.findNearestTiles(u.x, u.y, u.ownerId, true, 1)[0]
+        : undefined;
+    let defenderPursuing = false;
+    if (isCombatKind(u.kind)) {
       const cfg = combatConfig(u.kind);
       let target: Unit | Player | undefined;
       if (
@@ -754,19 +765,46 @@ export class World {
           ? now + GAME.simulation.targetCacheMs
           : now + GAME.simulation.intermediateIntervalMs;
       }
+      if (u.kind === "defender") {
+        const homeX = u.homeX ?? u.orderX,
+          homeY = u.homeY ?? u.orderY,
+          homeDistance = Math.hypot(u.x - homeX, u.y - homeY),
+          alliedDistance = defenderReturnTarget?.distance ?? 0,
+          canSortie = !!target &&
+            homeDistance <=
+              GAME.units.defender.guardRadius + GAME.units.defender.sortieMargin &&
+            (defenderStartedAllied ||
+              alliedDistance <= GAME.units.defender.sortieMargin),
+          mustReturn = !canSortie &&
+            (!defenderStartedAllied ||
+              homeDistance > GAME.units.defender.guardRadius);
+        defenderPursuing = canSortie;
+        if (mustReturn) {
+          target = undefined;
+          u.cachedTargetId = "";
+          u.cachedTargetUntil = now + GAME.simulation.intermediateIntervalMs;
+          const destination = defenderReturnTarget ?? { x: homeX, y: homeY };
+          const distance = Math.hypot(destination.x - u.x, destination.y - u.y) || 1;
+          u.dirX = (destination.x - u.x) / distance;
+          u.dirY = (destination.y - u.y) / distance;
+          u.nextThink = now + 200;
+          directed = true;
+        }
+      }
       if (target) {
         const d = dist(u, target);
-        if (
-          d <= cfg.range &&
-          now - u.lastAttack >= cfg.cooldownMs
-        ) {
-          u.lastAttack = now;
-          if ("kind" in target)
-            this.damageUnit(target, cfg.damage);
-          else this.damagePlayer(target, cfg.damage, u.ownerId);
-          return;
-        }
-        if (d > cfg.range) {
+        if (d <= cfg.range) {
+          u.dirX = u.dirY = 0;
+          u.nextThink = now + 200;
+          directed = true;
+          if (now - u.lastAttack >= cfg.cooldownMs) {
+            u.lastAttack = now;
+            if ("kind" in target)
+              this.damageUnit(target, cfg.damage);
+            else this.damagePlayer(target, cfg.damage, u.ownerId);
+            return;
+          }
+        } else {
           u.dirX = (target.x - u.x) / d;
           u.dirY = (target.y - u.y) / d;
           u.nextThink = now + 200;
@@ -803,6 +841,17 @@ export class World {
         }
       }
     }
+    if (u.kind === "defender" && !defenderPursuing && !directed) {
+      const homeX = u.homeX ?? u.orderX,
+        homeY = u.homeY ?? u.orderY,
+        homeDistance = Math.hypot(u.x - homeX, u.y - homeY);
+      if (homeDistance >= GAME.units.defender.guardRadius * 0.85) {
+        u.dirX = (homeX - u.x) / (homeDistance || 1);
+        u.dirY = (homeY - u.y) / (homeDistance || 1);
+        u.nextThink = now + 200;
+        directed = true;
+      }
+    }
     if (!directed && now >= u.nextThink) {
       u.nextThink = now + 700 + Math.random() * 900;
       const a = Math.random() * Math.PI * 2;
@@ -810,22 +859,68 @@ export class World {
       u.dirY = Math.sin(a);
     }
     const cfg = GAME.units[u.kind];
-    this.moveMobileUnit(u, cfg.speed, dt, defenderStartedAllied);
+    this.moveMobileUnit(
+      u,
+      cfg.speed,
+      dt,
+      u.kind === "defender"
+        ? {
+            stayOnAlliedTerritory: defenderStartedAllied && !defenderPursuing,
+            maxHomeDistance:
+              GAME.units.defender.guardRadius +
+              (defenderPursuing ? GAME.units.defender.sortieMargin : 0),
+            alliedAnchor: defenderPursuing ? defenderReturnTarget : undefined,
+            maxAlliedDistance: defenderPursuing
+              ? GAME.units.defender.sortieMargin
+              : undefined,
+          }
+        : undefined,
+    );
   }
-  moveMobileUnit(u: Unit, speed: number, dt: number, stayOnAlliedTerritory = false) {
+  moveMobileUnit(
+    u: Unit,
+    speed: number,
+    dt: number,
+    constraints?: {
+      stayOnAlliedTerritory?: boolean;
+      maxHomeDistance?: number;
+      alliedAnchor?: { x: number; y: number };
+      maxAlliedDistance?: number;
+    },
+  ) {
     if (!dt || (!u.dirX && !u.dirY)) return;
     const base = Math.atan2(u.dirY, u.dirX),
-      offsets = [0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2];
+      offsets = [
+        0,
+        Math.PI / 4,
+        -Math.PI / 4,
+        Math.PI / 2,
+        -Math.PI / 2,
+        Math.PI,
+      ];
     for (const offset of offsets) {
       const angle = base + offset,
         dx = Math.cos(angle),
         dy = Math.sin(angle),
         nx = clamp(u.x + dx * speed * dt, 0.1, GAME.map.width - 0.1),
-        ny = clamp(u.y + dy * speed * dt, 0.1, GAME.map.height - 0.1);
+        ny = clamp(u.y + dy * speed * dt, 0.1, GAME.map.height - 0.1),
+        candidateAllied =
+          this.map.get(key(Math.floor(nx), Math.floor(ny)))?.owner === u.ownerId,
+        beyondHome = constraints?.maxHomeDistance !== undefined &&
+          Math.hypot(nx - (u.homeX ?? u.orderX), ny - (u.homeY ?? u.orderY)) >
+            constraints.maxHomeDistance,
+        beyondAlliedMargin = !candidateAllied &&
+          constraints?.alliedAnchor !== undefined &&
+          constraints.maxAlliedDistance !== undefined &&
+          Math.hypot(
+            nx - constraints.alliedAnchor.x,
+            ny - constraints.alliedAnchor.y,
+          ) > constraints.maxAlliedDistance;
       if (
         this.isMovementBlocked(nx, ny) ||
-        (stayOnAlliedTerritory &&
-          this.map.get(key(Math.floor(nx), Math.floor(ny)))?.owner !== u.ownerId)
+        beyondHome ||
+        beyondAlliedMargin ||
+        (constraints?.stayOnAlliedTerritory && !candidateAllied)
       ) continue;
       u.x = nx;
       u.y = ny;
@@ -1072,12 +1167,16 @@ export class World {
     return best;
   }
   counts(id: string) {
-    return this.allCounts().get(id) ?? {
+    const units = this.unitCounts.get(id);
+    return {
       tiles: this.territoryCounts.get(id) ?? 0,
-      robots: 0,
-      soldiers: 0,
-      bastions: 0,
-      headquarters: 0,
+      robots: units?.robot ?? 0,
+      soldiers:
+        (units?.soldier ?? 0) +
+        (units?.attacker ?? 0) +
+        (units?.defender ?? 0),
+      bastions: units?.bastion ?? 0,
+      headquarters: units?.headquarters ?? 0,
     };
   }
   allCounts() {
@@ -1091,22 +1190,7 @@ export class World {
         headquarters: number;
       }
     >();
-    for (const player of this.players.values())
-      counts.set(player.id, {
-        tiles: this.territoryCounts.get(player.id) ?? 0,
-        robots: 0,
-        soldiers: 0,
-        bastions: 0,
-        headquarters: 0,
-      });
-    for (const unit of this.units.values()) {
-      const owner = counts.get(unit.ownerId);
-      if (!owner) continue;
-      if (unit.kind === "robot") owner.robots++;
-      else if (isCombatKind(unit.kind)) owner.soldiers++;
-      else if (unit.kind === "bastion") owner.bastions++;
-      else if (unit.kind === "headquarters") owner.headquarters++;
-    }
+    for (const player of this.players.values()) counts.set(player.id, this.counts(player.id));
     return counts;
   }
   isTileSupplied(x: number, y: number) {
@@ -1130,6 +1214,8 @@ export class World {
       if (tile.owner === id) this.setOwner(tileKey, tile, null);
     for (const unit of this.units.values())
       if (unit.ownerId === id) {
+        this.adjustUnitCount(id, unit.kind, -1);
+        this.adjustUnitCount(NEUTRAL_OWNER_ID, unit.kind, 1);
         unit.ownerId = NEUTRAL_OWNER_ID;
         unit.dirX = 0;
         unit.dirY = 0;
@@ -1142,6 +1228,7 @@ export class World {
       }
     this.players.delete(id);
     this.territoryCounts.delete(id);
+    this.unitCounts.delete(id);
     this.suppliedTerritoryCounts.delete(id);
     this.unsuppliedTerritoryCounts.delete(id);
     this.rustDirtyPlayers.delete(id);
@@ -1151,6 +1238,7 @@ export class World {
   removePlayer(id: string) {
     if (!this.players.delete(id)) return;
     this.capitals.delete(id);
+    this.unitCounts.delete(id);
     this.rustDirtyPlayers.delete(id);
     this.rustRemovedPlayers.set(id, ++this.rustVersion);
   }
@@ -1163,12 +1251,30 @@ export class World {
     if (!unit || !this.units.delete(id)) return;
     if (unit.kind === "bastion" && unit.bastionType === "wall")
       this.wallTiles.delete(key(Math.floor(unit.x), Math.floor(unit.y)));
+    this.adjustUnitCount(unit.ownerId, unit.kind, -1);
+    this.networkRemovedUnits.add(id);
     this.rustDirtyUnits.delete(id);
     this.rustRemovedUnits.set(id, ++this.rustVersion);
   }
   private markPlayer(id: string) {
     this.rustRemovedPlayers.delete(id);
     this.rustDirtyPlayers.set(id, ++this.rustVersion);
+  }
+  private unitCount(ownerId: string, kind: Unit["kind"]) {
+    return this.unitCounts.get(ownerId)?.[kind] ?? 0;
+  }
+  private adjustUnitCount(
+    ownerId: string,
+    kind: Unit["kind"],
+    amount: number,
+  ) {
+    let counts = this.unitCounts.get(ownerId);
+    if (!counts) {
+      if (amount <= 0) return;
+      counts = emptyUnitCounts();
+      this.unitCounts.set(ownerId, counts);
+    }
+    counts[kind] = Math.max(0, counts[kind] + amount);
   }
   private ackVersions(
     pending: Map<string, number>,

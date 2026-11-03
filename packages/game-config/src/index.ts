@@ -90,6 +90,7 @@ export const GAME = {
       detectionRange: 7,
       cooldownMs: 800,
       guardRadius: 12,
+      sortieMargin: 7,
       max: Number.POSITIVE_INFINITY,
     },
     bastion: {

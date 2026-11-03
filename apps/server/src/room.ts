@@ -29,6 +29,15 @@ type BotForces = {
 };
 
 const INTEREST_CELL_SIZE = 16;
+const MINIMAP_SCALE = 4;
+const MINIMAP_WIDTH = Math.ceil(GAME.map.width / MINIMAP_SCALE);
+const MINIMAP_HEIGHT = Math.ceil(GAME.map.height / MINIMAP_SCALE);
+type MinimapWire = [
+  0 | 1,
+  number,
+  number,
+  Array<[number, string | null]>,
+];
 
 export class DominionRoom extends Room {
   maxClients = GAME.room.maxPlayers;
@@ -51,13 +60,17 @@ export class DominionRoom extends Room {
   clientInterestCells = new Map<string, string>();
   globalUnitIds = new Map<string, number>();
   nextGlobalUnitId = 1;
+  minimapOwners: Array<string | null> = [];
   onCreate() {
     for (let i = 0; i < GAME.bots.count; i++) this.addBot();
     this.setSimulationInterval(
       (dt) => void this.step(dt / 1000),
       1000 / GAME.room.tickRate,
     );
-    this.onMessage("ready", (c) => this.sendFullInterestState(c));
+    this.onMessage("ready", (c) => {
+      this.sendFullInterestState(c);
+      this.sendFullMinimap(c);
+    });
     this.onMessage("input", (c, m) => {
       if (!this.allow(c)) return;
       const v = InputSchema.safeParse(m);
@@ -99,7 +112,6 @@ export class DominionRoom extends Room {
         message,
         ...counts,
       });
-      if (p) this.sendFullInterestState(c);
     });
     this.onMessage("build", (c, m) => {
       if (!this.allow(c)) return;
@@ -541,6 +553,93 @@ export class DominionRoom extends Room {
     for (const channelId of [...this.unitChannels.keys()])
       if (channelId.startsWith("interest:") && !activeChannels.has(channelId))
         this.unitChannels.delete(channelId);
+    // Numeric IDs only have to remain stable while the unit exists. Keeping
+    // every produced and destroyed unit here made long matches grow forever.
+    for (const unitId of this.world.networkRemovedUnits)
+      this.globalUnitIds.delete(unitId);
+    this.world.networkRemovedUnits.clear();
+    const minimapChanges = this.updateMinimap(changedTiles);
+    if (minimapChanges.length) {
+      const bytes = encode([
+        0,
+        MINIMAP_WIDTH,
+        MINIMAP_HEIGHT,
+        minimapChanges,
+      ] satisfies MinimapWire);
+      for (const client of this.clients)
+        client.sendBytes("minimap", bytes);
+    }
+  }
+  private ensureMinimap() {
+    if (this.minimapOwners?.length === MINIMAP_WIDTH * MINIMAP_HEIGHT)
+      return;
+    this.minimapOwners = Array.from(
+      { length: MINIMAP_WIDTH * MINIMAP_HEIGHT },
+      (_, index) => this.minimapOwner(index),
+    );
+  }
+  private minimapOwner(index: number) {
+    const cellX = index % MINIMAP_WIDTH,
+      cellY = Math.floor(index / MINIMAP_WIDTH),
+      startX = cellX * MINIMAP_SCALE,
+      startY = cellY * MINIMAP_SCALE,
+      owners = new Map<string, number>();
+    for (
+      let y = startY;
+      y < Math.min(startY + MINIMAP_SCALE, GAME.map.height);
+      y++
+    )
+      for (
+        let x = startX;
+        x < Math.min(startX + MINIMAP_SCALE, GAME.map.width);
+        x++
+      ) {
+        const owner = this.world.map.get(key(x, y))?.owner;
+        if (owner) owners.set(owner, (owners.get(owner) ?? 0) + 1);
+      }
+    let dominant: string | null = null,
+      best = 0;
+    for (const [owner, count] of owners)
+      if (count > best) {
+        dominant = owner;
+        best = count;
+      }
+    return dominant;
+  }
+  private sendFullMinimap(client: Client) {
+    this.ensureMinimap();
+    const owned = this.minimapOwners.flatMap((owner, index) =>
+      owner ? [[index, owner] as [number, string]] : [],
+    );
+    client.sendBytes(
+      "minimap",
+      encode([
+        1,
+        MINIMAP_WIDTH,
+        MINIMAP_HEIGHT,
+        owned,
+      ] satisfies MinimapWire),
+    );
+  }
+  private updateMinimap(changedTiles: string[]) {
+    this.ensureMinimap();
+    const affected = new Set<number>();
+    for (const tileKey of changedTiles) {
+      const [x, y] = tileKey.split(",").map(Number);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      affected.add(
+        Math.floor(y / MINIMAP_SCALE) * MINIMAP_WIDTH +
+          Math.floor(x / MINIMAP_SCALE),
+      );
+    }
+    const changed: Array<[number, string | null]> = [];
+    for (const index of affected) {
+      const owner = this.minimapOwner(index);
+      if (this.minimapOwners[index] === owner) continue;
+      this.minimapOwners[index] = owner;
+      changed.push([index, owner]);
+    }
+    return changed;
   }
   private interestSnapshot(
     cell: string,
@@ -552,13 +651,11 @@ export class DominionRoom extends Room {
       centerX = (cellX + 0.5) * INTEREST_CELL_SIZE,
       centerY = (cellY + 0.5) * INTEREST_CELL_SIZE,
       radius = GAME.map.unitInterestRadius + Math.SQRT2 * INTEREST_CELL_SIZE * 0.5,
-      nearbyUnits = full
-        ? [...this.world.units.values()].filter(
-            (unit) => Math.hypot(unit.x - centerX, unit.y - centerY) <= radius,
-          )
-        : [...this.world.spatial.query(centerX, centerY, radius)].filter(
-            (entity): entity is Unit => "kind" in entity,
-          ),
+      nearbyUnits = [...this.world.spatial.query(centerX, centerY, radius)].filter(
+        (entity): entity is Unit =>
+          "kind" in entity &&
+          Math.hypot(entity.x - centerX, entity.y - centerY) <= radius,
+      ),
       units = nearbyUnits
         .map((unit) => this.unitView(unit)),
       allPlayers = [...this.world.players.values()],

@@ -1,14 +1,53 @@
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Read, Write},
     time::Instant,
 };
-use rayon::prelude::*;
 use tile_dominion_simulation::{
     EngineMetrics, EngineRequest, HumanState, SimulationEvent, TickRequest, TickResponse,
     TileTargetIndex, UnitKind, choose_wander_direction, schedule_tick,
     zoned_world::{ZoneKey, ZonedWorld},
 };
+
+fn nearest_allied_within(
+    x: f32,
+    y: f32,
+    owner_id: u32,
+    radius: f32,
+    map_width: u32,
+    map_height: u32,
+    tile_owners: &[u32],
+) -> Option<(f32, f32, f32)> {
+    if map_width == 0 || map_height == 0 {
+        return None;
+    }
+    let radius_tiles = radius.ceil() as i32;
+    let center_x = x.floor() as i32;
+    let center_y = y.floor() as i32;
+    let mut nearest = None::<(f32, f32, f32)>;
+    for tile_y in (center_y - radius_tiles).max(0)
+        ..=(center_y + radius_tiles).min(map_height as i32 - 1)
+    {
+        for tile_x in (center_x - radius_tiles).max(0)
+            ..=(center_x + radius_tiles).min(map_width as i32 - 1)
+        {
+            let index = tile_y as u32 * map_width + tile_x as u32;
+            if tile_owners.get(index as usize).copied() != Some(owner_id) {
+                continue;
+            }
+            let allied_x = tile_x as f32 + 0.5;
+            let allied_y = tile_y as f32 + 0.5;
+            let distance = ((x - allied_x).powi(2) + (y - allied_y).powi(2)).sqrt();
+            if distance <= radius
+                && nearest.is_none_or(|(_, _, best_distance)| distance < best_distance)
+            {
+                nearest = Some((allied_x, allied_y, distance));
+            }
+        }
+    }
+    nearest
+}
 
 fn main() {
     let mut stdin = io::stdin().lock();
@@ -39,7 +78,7 @@ fn main() {
             break;
         };
         let decode_us = decode_started.elapsed().as_micros() as u64;
-        if request.protocol_version != 3 {
+        if request.protocol_version != 4 {
             break;
         }
         let sync_started = Instant::now();
@@ -94,7 +133,11 @@ fn main() {
         let zone_inputs = units
             .zones()
             .map(|zone| {
-                let local_ids = zone.units.iter().map(|unit| unit.id).collect::<HashSet<_>>();
+                let local_ids = zone
+                    .units
+                    .iter()
+                    .map(|unit| unit.id)
+                    .collect::<HashSet<_>>();
                 let mut visible = zone.units.clone();
                 visible.extend(zone.ghosts.iter().map(|ghost| ghost.state.clone()));
                 // A target already acquired remains visible to its attacker until the
@@ -107,7 +150,12 @@ fn main() {
                         }
                     }
                 }
-                (zone.key, local_ids, visible, *schedule_cursors.get(&zone.key).unwrap_or(&0))
+                (
+                    zone.key,
+                    local_ids,
+                    visible,
+                    *schedule_cursors.get(&zone.key).unwrap_or(&0),
+                )
             })
             .collect::<Vec<_>>();
         let schedule_started = Instant::now();
@@ -125,7 +173,9 @@ fn main() {
                     start_index: cursor,
                 };
                 let mut result = schedule_tick(&mut tick);
-                result.schedules.retain(|schedule| local_ids.contains(&schedule.id));
+                result
+                    .schedules
+                    .retain(|schedule| local_ids.contains(&schedule.id));
                 (key, result)
             })
             .collect::<Vec<_>>();
@@ -175,7 +225,11 @@ fn main() {
                 units
                     .get(id)
                     .map(|target| (target.x, target.y, target.owner_id, false))
-                    .or_else(|| humans.get(id).map(|target| (target.x, target.y, target.id, true)))
+                    .or_else(|| {
+                        humans
+                            .get(id)
+                            .map(|target| (target.x, target.y, target.id, true))
+                    })
             });
             let defender_started_allied = units.get(&schedule.id).is_some_and(|unit| {
                 if unit.kind != UnitKind::Defender || map_width == 0 || map_height == 0 {
@@ -189,20 +243,48 @@ fn main() {
                 if unit.kind != UnitKind::Defender || defender_started_allied {
                     return None;
                 }
-                let cache_key = (unit.owner_id, unit.x.max(0.0) as u32 / 8, unit.y.max(0.0) as u32 / 8);
+                let cache_key = (
+                    unit.owner_id,
+                    unit.x.max(0.0) as u32 / 8,
+                    unit.y.max(0.0) as u32 / 8,
+                );
                 if let Some(target) = defender_return_cache.get(&cache_key) {
                     return Some(*target);
                 }
-                let target = allied_tiles_by_owner.get(&unit.owner_id)?.iter().copied().min_by(
-                    |a, b| {
+                let target = allied_tiles_by_owner
+                    .get(&unit.owner_id)?
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| {
                         let distance_a = (a.0 - unit.x).powi(2) + (a.1 - unit.y).powi(2);
                         let distance_b = (b.0 - unit.x).powi(2) + (b.1 - unit.y).powi(2);
                         distance_a.total_cmp(&distance_b)
-                    },
-                )?;
+                    })?;
                 defender_return_cache.insert(cache_key, target);
                 Some(target)
             });
+            let (defender_home_distance, defender_sortie_anchor) = units
+                .get(&schedule.id)
+                .filter(|unit| unit.kind == UnitKind::Defender)
+                .map(|unit| {
+                    let home_distance =
+                        ((unit.x - unit.order_x).powi(2) + (unit.y - unit.order_y).powi(2)).sqrt();
+                    let sortie_anchor = nearest_allied_within(
+                        unit.x,
+                        unit.y,
+                        unit.owner_id,
+                        config.defender_sortie_margin,
+                        map_width,
+                        map_height,
+                        &tile_owners,
+                    );
+                    (home_distance, sortie_anchor)
+                })
+                .unwrap_or((0.0, None));
+            let defender_can_sortie = target_state.is_some()
+                && defender_home_distance
+                    <= config.defender_guard_radius + config.defender_sortie_margin
+                && defender_sortie_anchor.is_some();
             if let Some(unit) = units.get_mut(&schedule.id) {
                 unit.last_simulated_at = request.now;
                 unit.next_simulation_at = schedule.next_simulation_at;
@@ -214,7 +296,18 @@ fn main() {
                 };
                 if unit.kind.is_combat() {
                     let mut directed = false;
-                    if let Some((target_x, target_y)) = defender_return_target {
+                    let defender_must_return = unit.kind == UnitKind::Defender
+                        && !defender_can_sortie
+                        && (!defender_started_allied
+                            || defender_home_distance > config.defender_guard_radius);
+                    let defender_return_position = if defender_must_return {
+                        defender_return_target.or(Some((unit.order_x, unit.order_y)))
+                    } else {
+                        None
+                    };
+                    if let Some((target_x, target_y)) = defender_return_position {
+                        schedule.target_id = None;
+                        unit.cached_target_id = None;
                         let dx = target_x - unit.x;
                         let dy = target_y - unit.y;
                         let distance = (dx * dx + dy * dy).sqrt().max(0.001);
@@ -222,16 +315,42 @@ fn main() {
                         unit.dir_y = dy / distance;
                         unit.next_think = request.now + 200;
                         directed = true;
-                    } else if let Some((target_x, target_y, _, _)) = target_state {
+                    } else if let Some((target_x, target_y, _, _)) = target_state
+                        .filter(|_| unit.kind != UnitKind::Defender || defender_can_sortie)
+                    {
                         let dx = target_x - unit.x;
                         let dy = target_y - unit.y;
                         let distance = (dx * dx + dy * dy).sqrt();
-                        if distance > 0.001 {
+                        let attack_range = match unit.kind {
+                            UnitKind::Soldier => config.soldier_range,
+                            UnitKind::Attacker => config.attacker_range,
+                            UnitKind::Defender => config.defender_range,
+                            _ => 0.0,
+                        };
+                        if distance > attack_range {
                             unit.dir_x = dx / distance;
                             unit.dir_y = dy / distance;
                             unit.next_think = request.now + 200;
                             directed = true;
+                        } else {
+                            unit.dir_x = 0.0;
+                            unit.dir_y = 0.0;
+                            unit.next_think = request.now + 200;
+                            directed = true;
                         }
+                    }
+                    if unit.kind == UnitKind::Defender
+                        && !defender_can_sortie
+                        && !directed
+                        && defender_home_distance >= config.defender_guard_radius * 0.85
+                    {
+                        let dx = unit.order_x - unit.x;
+                        let dy = unit.order_y - unit.y;
+                        let distance = (dx * dx + dy * dy).sqrt().max(0.001);
+                        unit.dir_x = dx / distance;
+                        unit.dir_y = dy / distance;
+                        unit.next_think = request.now + 200;
+                        directed = true;
                     }
                     if !directed {
                         let destination = match unit.order.as_str() {
@@ -290,10 +409,14 @@ fn main() {
                 {
                     let mut nearest = None::<(u32, f32)>;
                     for target in unit_snapshot.values() {
-                        if target.id == unit.id || target.owner_id == unit.owner_id || target.hp <= 0.0 {
+                        if target.id == unit.id
+                            || target.owner_id == unit.owner_id
+                            || target.hp <= 0.0
+                        {
                             continue;
                         }
-                        let distance = ((target.x - unit.x).powi(2) + (target.y - unit.y).powi(2)).sqrt();
+                        let distance =
+                            ((target.x - unit.x).powi(2) + (target.y - unit.y).powi(2)).sqrt();
                         if distance <= config.turret_range
                             && nearest.is_none_or(|(_, best)| distance < best)
                         {
@@ -307,7 +430,8 @@ fn main() {
                         {
                             continue;
                         }
-                        let distance = ((target.x - unit.x).powi(2) + (target.y - unit.y).powi(2)).sqrt();
+                        let distance =
+                            ((target.x - unit.x).powi(2) + (target.y - unit.y).powi(2)).sqrt();
                         if distance <= config.turret_range
                             && nearest.is_none_or(|(_, best)| distance < best)
                         {
@@ -330,8 +454,10 @@ fn main() {
                     && (unit.bastion_type == 1 || unit.bastion_type == 2)
                     && request.now >= unit.next_produce
                 {
-                    let produced_defenders =
-                        produced_by_bastion.get(&unit.id).copied().unwrap_or_default();
+                    let produced_defenders = produced_by_bastion
+                        .get(&unit.id)
+                        .copied()
+                        .unwrap_or_default();
                     let is_factory = unit.bastion_type == 2;
                     let interval = if is_factory {
                         config.factory_production_ms
@@ -364,23 +490,27 @@ fn main() {
                         hold_position_for_capture = true;
                     } else {
                         let candidates = tile_targets.nearest_non_allied_candidates(
-                            unit.x, unit.y, unit.owner_id, &tile_owners, 3,
+                            unit.x,
+                            unit.y,
+                            unit.owner_id,
+                            &tile_owners,
+                            3,
                         );
                         let choice = if candidates.is_empty() {
                             None
                         } else {
-                            let hash = unit.id.wrapping_mul(16_777_619)
-                                ^ (request.now / 1_000) as u32;
+                            let hash =
+                                unit.id.wrapping_mul(16_777_619) ^ (request.now / 1_000) as u32;
                             candidates.get(hash as usize % candidates.len()).copied()
                         };
                         if let Some((target_x, target_y)) = choice {
-                        let dx = target_x - unit.x;
-                        let dy = target_y - unit.y;
-                        let distance = (dx * dx + dy * dy).sqrt();
-                        if distance > 0.001 {
-                            unit.dir_x = dx / distance;
-                            unit.dir_y = dy / distance;
-                        }
+                            let dx = target_x - unit.x;
+                            let dy = target_y - unit.y;
+                            let distance = (dx * dx + dy * dy).sqrt();
+                            if distance > 0.001 {
+                                unit.dir_x = dx / distance;
+                                unit.dir_y = dy / distance;
+                            }
                         }
                     }
                 }
@@ -391,7 +521,11 @@ fn main() {
                     }
                     UnitKind::Bastion | UnitKind::Headquarters => 0.0,
                 };
-                if !hold_position_for_capture && speed > 0.0 && schedule.dt > 0.0 {
+                if !hold_position_for_capture
+                    && speed > 0.0
+                    && schedule.dt > 0.0
+                    && (unit.dir_x.abs() > 0.001 || unit.dir_y.abs() > 0.001)
+                {
                     let base = unit.dir_y.atan2(unit.dir_x);
                     let offsets = [
                         0.0,
@@ -399,7 +533,9 @@ fn main() {
                         -std::f32::consts::FRAC_PI_4,
                         std::f32::consts::FRAC_PI_2,
                         -std::f32::consts::FRAC_PI_2,
+                        std::f32::consts::PI,
                     ];
+                    let mut moved = false;
                     for offset in offsets {
                         let angle = base + offset;
                         let dx = angle.cos();
@@ -410,14 +546,34 @@ fn main() {
                             (unit.y + dy * speed * schedule.dt).clamp(0.1, config.map_height - 0.1);
                         let tile_x = nx.floor() as u32;
                         let tile_y = ny.floor() as u32;
+                        let candidate_owner = tile_owners
+                            .get((tile_y * map_width + tile_x) as usize)
+                            .copied();
+                        let defender_leash = if defender_can_sortie {
+                            config.defender_guard_radius + config.defender_sortie_margin
+                        } else {
+                            config.defender_guard_radius
+                        };
+                        let beyond_home_leash = unit.kind == UnitKind::Defender
+                            && ((nx - unit.order_x).powi(2) + (ny - unit.order_y).powi(2))
+                                > defender_leash.powi(2);
+                        let beyond_sortie_margin = unit.kind == UnitKind::Defender
+                            && defender_can_sortie
+                            && candidate_owner != Some(unit.owner_id)
+                            && defender_sortie_anchor.is_some_and(|(allied_x, allied_y, _)| {
+                                ((nx - allied_x).powi(2) + (ny - allied_y).powi(2))
+                                    > config.defender_sortie_margin.powi(2)
+                            });
                         let blocked = map_width > 0
                             && map_height > 0
                             && (obstacles.contains(&(tile_y * map_width + tile_x))
                                 || wall_obstacles.contains(&(tile_y * map_width + tile_x))
+                                || beyond_home_leash
+                                || beyond_sortie_margin
                                 || (unit.kind == UnitKind::Defender
                                     && defender_started_allied
-                                    && tile_owners.get((tile_y * map_width + tile_x) as usize).copied()
-                                        != Some(unit.owner_id)));
+                                    && !defender_can_sortie
+                                    && candidate_owner != Some(unit.owner_id)));
                         if blocked {
                             continue;
                         }
@@ -425,7 +581,11 @@ fn main() {
                         unit.y = ny;
                         unit.dir_x = dx;
                         unit.dir_y = dy;
+                        moved = true;
                         break;
+                    }
+                    if !moved {
+                        unit.next_think = 0;
                     }
                 }
                 if unit.kind == UnitKind::Robot && map_width > 0 && map_height > 0 {
@@ -438,7 +598,11 @@ fn main() {
                             unit.capture_tile = Some(tile_index);
                             unit.capture_since = request.now;
                         }
-                        let multiplier = if previous_owner == 0 { 1.0 } else { config.enemy_capture_multiplier };
+                        let multiplier = if previous_owner == 0 {
+                            1.0
+                        } else {
+                            config.enemy_capture_multiplier
+                        };
                         let duration = (config.robot_capture_ms as f32 * multiplier) as u64;
                         if request.now.saturating_sub(unit.capture_since) >= duration {
                             if let Some(owner) = tile_owners.get_mut(tile_index as usize) {
@@ -463,12 +627,25 @@ fn main() {
                         (schedule.target_id, target_state)
                     {
                         let (damage, range, cooldown) = match unit.kind {
-                            UnitKind::Soldier => (config.soldier_damage, config.soldier_range, config.soldier_cooldown_ms),
-                            UnitKind::Attacker => (config.attacker_damage, config.attacker_range, config.attacker_cooldown_ms),
-                            UnitKind::Defender => (config.defender_damage, config.defender_range, config.defender_cooldown_ms),
+                            UnitKind::Soldier => (
+                                config.soldier_damage,
+                                config.soldier_range,
+                                config.soldier_cooldown_ms,
+                            ),
+                            UnitKind::Attacker => (
+                                config.attacker_damage,
+                                config.attacker_range,
+                                config.attacker_cooldown_ms,
+                            ),
+                            UnitKind::Defender => (
+                                config.defender_damage,
+                                config.defender_range,
+                                config.defender_cooldown_ms,
+                            ),
                             _ => unreachable!(),
                         };
-                        let distance = ((target_x - unit.x).powi(2) + (target_y - unit.y).powi(2)).sqrt();
+                        let distance =
+                            ((target_x - unit.x).powi(2) + (target_y - unit.y).powi(2)).sqrt();
                         let target_vulnerable = !is_human
                             || humans.get(&target_id).is_some_and(|human| {
                                 human.alive && request.now >= human.invulnerable_until
@@ -515,11 +692,18 @@ fn main() {
             let tile_owner = if map_width > 0 && map_height > 0 {
                 let x = target.x.floor().clamp(0.0, map_width as f32 - 1.0) as u32;
                 let y = target.y.floor().clamp(0.0, map_height as f32 - 1.0) as u32;
-                tile_owners.get((y * map_width + x) as usize).copied().unwrap_or(0)
+                tile_owners
+                    .get((y * map_width + x) as usize)
+                    .copied()
+                    .unwrap_or(0)
             } else {
                 0
             };
-            let reduction = if tile_owner == target.owner_id { 0.5 } else { 1.0 };
+            let reduction = if tile_owner == target.owner_id {
+                0.5
+            } else {
+                1.0
+            };
             event.amount *= reduction;
             let killed = if let Some(target) = units.get_mut(&event.target_id) {
                 target.hp -= event.amount;

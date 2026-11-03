@@ -21,6 +21,7 @@ pub struct SimulationConfig {
     pub target_cache_ms: u64,
     pub tick_budget_us: u64,
     pub defender_guard_radius: f32,
+    pub defender_sortie_margin: f32,
     pub robot_capture_ms: u64,
     pub enemy_capture_multiplier: f32,
     pub soldier_damage: f32,
@@ -523,7 +524,9 @@ impl TileTargetIndex {
                 }
             }
         }
-        best.into_iter().map(|(tile_x, tile_y, _)| (tile_x, tile_y)).collect()
+        best.into_iter()
+            .map(|(tile_x, tile_y, _)| (tile_x, tile_y))
+            .collect()
     }
 
     fn insert(&mut self, index: u32) {
@@ -630,7 +633,7 @@ pub fn schedule_tick(request: &mut TickRequest) -> TickResponse {
                     (human.id != unit.owner_id
                         && human.alive
                         && distance_sq(unit.x, unit.y, human.x, human.y) <= max_sq)
-                    .then_some(human_index)
+                        .then_some(human_index)
                 },
             ));
         }
@@ -774,6 +777,7 @@ mod tests {
             target_cache_ms: 2000,
             tick_budget_us: 35_000,
             defender_guard_radius: 12.0,
+            defender_sortie_margin: 7.0,
             robot_capture_ms: 1100,
             enemy_capture_multiplier: 3.0,
             soldier_damage: 12.0,
@@ -1018,7 +1022,10 @@ mod tests {
             index.nearest_non_allied(0.5, 0.5, 10, &owners),
             Some((0.5, 1.5))
         );
-        assert_eq!(index.nearest_allied(2.5, 0.5, 10, &owners), Some((1.5, 0.5)));
+        assert_eq!(
+            index.nearest_allied(2.5, 0.5, 10, &owners),
+            Some((1.5, 0.5))
+        );
     }
 
     #[test]

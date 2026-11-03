@@ -62,7 +62,8 @@ describe("Rust engine executable", () => {
       soldier.dirY = schedules[0].dir_y;
       const secondTick = await engine.schedule(1050, [soldier], [enemy]);
       expect(secondTick).toHaveLength(1);
-      expect(secondTick[0].x).toBeGreaterThan(schedules[0].x);
+      expect(secondTick[0].x).toBe(schedules[0].x);
+      expect([secondTick[0].dir_x, secondTick[0].dir_y]).toEqual([0, 0]);
     } finally {
       engine.close();
     }
@@ -247,6 +248,129 @@ describe("Rust engine executable", () => {
       defender.lastSimulatedAt = 1000;
       const [returned] = await engine.schedule(1500, [defender], []);
       expect(returned.x).toBeLessThan(defender.x);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("lets defenders cross the border by seven tiles only while pursuing", async () => {
+    const engine = new RustEngine(),
+      map = new Map([["10,10", { owner: "p1", obstacle: false }]]),
+      defender = {
+        id: "sortie-defender", ownerId: "p1", kind: "defender",
+        x: 10.5, y: 10.5, hp: 210, dirX: 1, dirY: 0,
+        order: "guard", orderX: 10.5, orderY: 10.5,
+        homeX: 10.5, homeY: 10.5, nextThink: 0,
+        nextSimulationAt: 0, lastSimulatedAt: 500,
+        cachedTargetId: "", cachedTargetUntil: 0,
+      } as Unit,
+      enemy = {
+        id: "sortie-target", ownerId: "p2", kind: "robot",
+        x: 14.5, y: 10.5, hp: 45, dirX: 0, dirY: 0,
+        order: "wander", orderX: 14.5, orderY: 10.5,
+        nextThink: Number.MAX_SAFE_INTEGER, nextSimulationAt: 0,
+        lastSimulatedAt: 500, cachedTargetId: "", cachedTargetUntil: 0,
+      } as Unit;
+    try {
+      const first = await engine.schedule(1000, [defender, enemy], [], map),
+        sortie = first.find(({ id }) => id === defender.id)!;
+      expect(sortie.target_id).toBe(enemy.id);
+      expect(sortie.x).toBeGreaterThan(11);
+
+      Object.assign(defender, {
+        x: 18,
+        y: 10.5,
+        dirX: 1,
+        dirY: 0,
+        nextSimulationAt: 0,
+        lastSimulatedAt: 1000,
+        cachedTargetId: enemy.id,
+        cachedTargetUntil: 5000,
+      });
+      enemy.x = 18.5;
+      enemy.y = 10.5;
+      enemy.nextSimulationAt = Number.MAX_SAFE_INTEGER;
+      const second = await engine.schedule(1500, [defender, enemy], []),
+        returned = second.find(({ id }) => id === defender.id)!;
+      expect(returned.target_id).toBeNull();
+      expect(returned.x).toBeLessThan(defender.x);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("keeps a defender moving when it reaches its patrol leash", async () => {
+    const engine = new RustEngine(),
+      map = new Map<string, { owner: string | null; obstacle: boolean }>();
+    for (let x = 10; x <= 22; x++)
+      map.set(`${x},10`, { owner: "p1", obstacle: false });
+    const defender = {
+      id: "patrol-edge", ownerId: "p1", kind: "defender",
+      x: 21.5, y: 10.5, hp: 210, dirX: 1, dirY: 0,
+      order: "guard", orderX: 10.5, orderY: 10.5,
+      homeX: 10.5, homeY: 10.5, nextThink: 5000,
+      nextSimulationAt: 0, lastSimulatedAt: 500,
+      cachedTargetId: "", cachedTargetUntil: 5000,
+    } as Unit;
+    try {
+      const [schedule] = await engine.schedule(1000, [defender], [], map);
+      expect(schedule.x).toBeLessThan(defender.x);
+      expect(schedule.dir_x).toBeLessThan(0);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("does not turn a zero defender direction into an eastward drift", async () => {
+    const engine = new RustEngine(),
+      defender = {
+        id: "stationary-defender", ownerId: "p1", kind: "defender",
+        x: 10.5, y: 10.5, hp: 210, dirX: 0, dirY: 0,
+        order: "guard", orderX: 10.5, orderY: 10.5,
+        homeX: 10.5, homeY: 10.5, nextThink: 5000,
+        nextSimulationAt: 0, lastSimulatedAt: 500,
+        cachedTargetId: "", cachedTargetUntil: 5000,
+      } as Unit;
+    try {
+      const [schedule] = await engine.schedule(1000, [defender], []);
+      expect(schedule.x).toBe(defender.x);
+      expect(schedule.y).toBe(defender.y);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("stops a defender that already has its target in range", async () => {
+    const engine = new RustEngine(),
+      defender = {
+        id: "ranged-defender", ownerId: "p1", kind: "defender",
+        x: 10.5, y: 10.5, hp: 210, dirX: 1, dirY: 0,
+        order: "guard", orderX: 10.5, orderY: 10.5,
+        homeX: 10.5, homeY: 10.5, nextThink: 0,
+        nextSimulationAt: 0, lastSimulatedAt: 500,
+        cachedTargetId: "ranged-target", cachedTargetUntil: 5000,
+        lastAttack: 900,
+      } as Unit,
+      target = {
+        id: "ranged-target", ownerId: "p2", kind: "robot",
+        x: 12.5, y: 10.5, hp: 45, dirX: 0, dirY: 0,
+        order: "wander", orderX: 12.5, orderY: 10.5,
+        nextThink: Number.MAX_SAFE_INTEGER,
+        nextSimulationAt: Number.MAX_SAFE_INTEGER, lastSimulatedAt: 500,
+        cachedTargetId: "", cachedTargetUntil: 0,
+      } as Unit;
+    try {
+      const schedules = await engine.schedule(
+          1000,
+          [defender, target],
+          [],
+          new Map([["10,10", { owner: "p1", obstacle: false }]]),
+        ),
+        schedule = schedules.find(({ id }) => id === defender.id)!;
+      expect(schedule.target_id).toBe(target.id);
+      expect(schedule.x).toBe(defender.x);
+      expect(schedule.y).toBe(defender.y);
+      expect([schedule.dir_x, schedule.dir_y]).toEqual([0, 0]);
     } finally {
       engine.close();
     }

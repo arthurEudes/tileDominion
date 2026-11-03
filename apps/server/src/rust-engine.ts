@@ -4,7 +4,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import { GAME } from "@tile/game-config";
 import type { Player, Unit } from "./model.js";
 
-export const RUST_PROTOCOL_VERSION = 3;
+export const RUST_PROTOCOL_VERSION = 4;
 const DEFAULT_REQUEST_TIMEOUT_MS = 100;
 
 export function rustExecutablePath(platform = process.platform) {
@@ -279,6 +279,7 @@ export class RustEngine {
         GAME.simulation.targetCacheMs,
         GAME.simulation.tickBudgetMs * 1000,
         GAME.units.defender.guardRadius,
+        GAME.units.defender.sortieMargin,
         GAME.capture.holdMs * GAME.capture.robotMultiplier,
         GAME.capture.enemyMultiplier,
         GAME.units.soldier.damage,
@@ -307,6 +308,7 @@ export class RustEngine {
     if (map) this.mapInitialized = true;
     return this.send(requestId, request).then((result) => {
       for (const id of removedUnitIds) this.forgetId(id);
+      for (const id of removedHumanIds) this.forgetId(id);
       return result;
     });
   }

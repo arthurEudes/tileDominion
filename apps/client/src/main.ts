@@ -70,6 +70,7 @@ class Dominion extends Phaser.Scene {
   stick = { x: 0, y: 0 };
   inputElapsed = 0;
   localInput = { x: 0, y: 0 };
+  impactBudget = 0;
   create() {
     sceneRef = this;
     this.cameras.main.setBackgroundColor(0x0a1827);
@@ -319,6 +320,30 @@ class Dominion extends Phaser.Scene {
     }
     for (const texture of refreshed) texture.refresh();
   }
+  pruneTileCache(tiles: ClientSnapshot["tiles"]) {
+    const chunkSize = 16,
+      retainedChunks = new Set(
+        tiles.map(([x, y]) =>
+          `${Math.floor(x / chunkSize)},${Math.floor(y / chunkSize)}`,
+        ),
+      ),
+      chunkForTile = (tileKey: string) => {
+        const [x, y] = tileKey.split(",").map(Number);
+        return `${Math.floor(x / chunkSize)},${Math.floor(y / chunkSize)}`;
+      };
+    for (const [chunkKey, chunk] of this.tileChunks) {
+      if (retainedChunks.has(chunkKey)) continue;
+      chunk.image.destroy();
+      this.textures.remove(chunk.texture.key);
+      this.tileChunks.delete(chunkKey);
+    }
+    for (const tileKey of this.tileColors.keys())
+      if (!retainedChunks.has(chunkForTile(tileKey)))
+        this.tileColors.delete(tileKey);
+    for (const tileKey of this.obstacles)
+      if (!retainedChunks.has(chunkForTile(tileKey)))
+        this.obstacles.delete(tileKey);
+  }
   update(_time: number, delta: number) {
     const blend = 1 - Math.exp(-delta / 70);
     for (const [id, a] of this.actors) {
@@ -501,6 +526,17 @@ class Dominion extends Phaser.Scene {
     });
   }
   impact(x: number, y: number) {
+    const view = this.cameras.main.worldView,
+      margin = 32;
+    if (
+      this.impactBudget <= 0 ||
+      x < view.x - margin ||
+      x > view.right + margin ||
+      y < view.y - margin ||
+      y > view.bottom + margin
+    )
+      return;
+    this.impactBudget--;
     const flash = this.add.circle(x, y, 8, 0xffd166, 0.95).setDepth(50);
     this.tweens.add({
       targets: flash,
@@ -548,8 +584,10 @@ class Dominion extends Phaser.Scene {
       knob.style.transform = "";
     });
   }
-  render(s: ClientSnapshot) {
+  render(s: ClientSnapshot, fullState = false) {
     snap = s;
+    this.impactBudget = 6;
+    if (fullState) this.pruneTileCache(s.tiles);
     if (!this.mapBase)
       this.mapBase = this.add
         .rectangle(
@@ -673,6 +711,78 @@ class Dominion extends Phaser.Scene {
     }
   }
 }
+type MinimapMessage = [
+  0 | 1,
+  number,
+  number,
+  Array<[number, string | null]>,
+];
+class StrategicMinimap {
+  private context: CanvasRenderingContext2D;
+  private marker: HTMLElement;
+  private owners: Array<string | null> = [];
+  private colors = new Map<string, number>();
+  private width = 0;
+  private height = 0;
+  constructor(private canvas: HTMLCanvasElement, root: HTMLElement) {
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas de mini-carte indisponible");
+    this.context = context;
+    this.marker = root.querySelector("i") as HTMLElement;
+  }
+  apply([full, width, height, changes]: MinimapMessage) {
+    if (full || width !== this.width || height !== this.height) {
+      this.width = width;
+      this.height = height;
+      this.canvas.width = width;
+      this.canvas.height = height;
+      this.owners = new Array<string | null>(width * height).fill(null);
+      this.context.fillStyle = "#10263a";
+      this.context.fillRect(0, 0, width, height);
+    }
+    for (const [index, owner] of changes) {
+      if (index < 0 || index >= this.owners.length) continue;
+      this.owners[index] = owner;
+      this.drawCell(index, owner);
+    }
+  }
+  updateWorld(snapshot: ClientSnapshot, playerId: string) {
+    let paletteChanged = false;
+    for (const player of snapshot.leaderboard)
+      if (this.colors.get(player.id) !== player.color) {
+        this.colors.set(player.id, player.color);
+        paletteChanged = true;
+      }
+    if (paletteChanged) this.redraw();
+    const player = snapshot.players.find(({ id }) => id === playerId);
+    if (!player) {
+      this.marker.hidden = true;
+      return;
+    }
+    this.marker.hidden = false;
+    this.marker.style.left = `${(player.x / snapshot.width) * 100}%`;
+    this.marker.style.top = `${(player.y / snapshot.height) * 100}%`;
+  }
+  private redraw() {
+    if (!this.width || !this.height) return;
+    this.context.fillStyle = "#10263a";
+    this.context.fillRect(0, 0, this.width, this.height);
+    for (let index = 0; index < this.owners.length; index++) {
+      const owner = this.owners[index];
+      if (owner) this.drawCell(index, owner);
+    }
+  }
+  private drawCell(index: number, owner: string | null) {
+    const color = owner ? (this.colors.get(owner) ?? 0x465565) : 0x10263a;
+    this.context.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+    this.context.fillRect(index % this.width, Math.floor(index / this.width), 1, 1);
+  }
+}
+const minimapRoot = $("#minimap"),
+  minimap = new StrategicMinimap(
+    minimapRoot.querySelector("canvas") as HTMLCanvasElement,
+    minimapRoot,
+  );
 const game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: "game",
@@ -751,7 +861,15 @@ $("#play").onclick = async () => {
         if (ob) sceneRef?.obstacles.add(k);
         else sceneRef?.obstacles.delete(k);
       }
-      sceneRef?.render(s);
+      minimap.updateWorld(s, myId);
+      sceneRef?.render(s, !!wire[5][3]);
+    });
+    room.onMessage("minimap", (payload: MinimapMessage | Uint8Array) => {
+      const wire = payload instanceof Uint8Array
+        ? (decode(payload) as MinimapMessage)
+        : payload;
+      minimap.apply(wire);
+      if (snap) minimap.updateWorld(snap, myId);
     });
     room.onMessage(
       "purchase",

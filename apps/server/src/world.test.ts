@@ -397,6 +397,97 @@ describe("authoritative rules", () => {
     w.tickUnit(defender, 0.5, 2000);
     expect(defender.dirX).toBeLessThan(0);
   });
+  it("lets defenders sortie seven tiles for a target then sends them home", () => {
+    const w = world(),
+      owner = w.addPlayer("owner", "Owner", 1),
+      enemy = w.addPlayer("enemy", "Enemy", 2);
+    owner.money = enemy.money = 999;
+    w.buy(owner.id, "defender");
+    w.buy(enemy.id, "robot");
+    const defender = [...w.units.values()].find(
+        (unit) => unit.ownerId === owner.id && unit.kind === "defender",
+      )!,
+      robot = [...w.units.values()].find(
+        (unit) => unit.ownerId === enemy.id && unit.kind === "robot",
+      )!;
+    for (const tile of w.map.values()) tile.owner = null;
+    w.map.get(key(10, 10))!.owner = owner.id;
+    Object.assign(defender, {
+      x: 10.5,
+      y: 10.5,
+      homeX: 10.5,
+      homeY: 10.5,
+      orderX: 10.5,
+      orderY: 10.5,
+      nextThink: 0,
+    });
+    robot.x = 14.5;
+    robot.y = 10.5;
+    w.spatial.rebuild(w.players.values(), w.units.values());
+    w.tickUnit(defender, 0.5, 1000);
+    expect(defender.x).toBeGreaterThan(11);
+    expect(w.map.get(key(Math.floor(defender.x), 10))?.owner).not.toBe(owner.id);
+
+    defender.x = 18;
+    defender.y = 10.5;
+    defender.nextThink = 0;
+    robot.x = 18.5;
+    robot.y = 10.5;
+    w.spatial.rebuild(w.players.values(), w.units.values());
+    w.tickUnit(defender, 0.1, 2000);
+    expect(defender.dirX).toBeLessThan(0);
+    expect(defender.cachedTargetId).toBe("");
+  });
+  it("turns defenders back before the invisible patrol edge can pin them", () => {
+    const w = world(),
+      owner = w.addPlayer("owner", "Owner", 1);
+    owner.money = 999;
+    w.buy(owner.id, "defender");
+    const defender = [...w.units.values()].find(
+      (unit) => unit.kind === "defender",
+    )!;
+    for (const tile of w.map.values()) tile.owner = null;
+    for (let x = 10; x <= 22; x++) w.map.get(key(x, 10))!.owner = owner.id;
+    Object.assign(defender, {
+      x: 21.5,
+      y: 10.5,
+      homeX: 10.5,
+      homeY: 10.5,
+      orderX: 10.5,
+      orderY: 10.5,
+      dirX: 1,
+      dirY: 0,
+      nextThink: 5000,
+    });
+    const before = defender.x;
+    w.spatial.rebuild(w.players.values(), w.units.values());
+    w.tickUnit(defender, 0.5, 1000);
+    expect(defender.x).toBeLessThan(before);
+    expect(defender.dirX).toBeLessThan(0);
+  });
+  it("holds a defender still while its nearby target is in range", () => {
+    const w = world(),
+      owner = w.addPlayer("owner", "Owner", 1),
+      enemy = w.addPlayer("enemy", "Enemy", 2);
+    owner.money = enemy.money = 999;
+    w.buy(owner.id, "defender");
+    w.buy(enemy.id, "robot");
+    const defender = [...w.units.values()].find(
+        (unit) => unit.ownerId === owner.id && unit.kind === "defender",
+      )!,
+      robot = [...w.units.values()].find(
+        (unit) => unit.ownerId === enemy.id && unit.kind === "robot",
+      )!;
+    robot.x = defender.x + GAME.units.defender.range - 0.2;
+    robot.y = defender.y;
+    defender.dirX = 1;
+    defender.lastAttack = 1000;
+    const before = { x: defender.x, y: defender.y };
+    w.spatial.rebuild(w.players.values(), w.units.values());
+    w.tickUnit(defender, 0.5, 1100);
+    expect({ x: defender.x, y: defender.y }).toEqual(before);
+    expect([defender.dirX, defender.dirY]).toEqual([0, 0]);
+  });
   it("blocks allied and enemy movement with a destructible wall", () => {
     const w = world(),
       owner = w.addPlayer("owner", "Owner", 1),
@@ -853,5 +944,11 @@ describe("authoritative rules", () => {
       soldiers: 1,
       headquarters: 0,
     });
+    const attacker = [...w.units.values()].find(
+      (unit) => unit.ownerId === b.id && unit.kind === "attacker",
+    )!;
+    w.damageUnit(attacker, 9999);
+    expect(w.counts(b.id).soldiers).toBe(0);
+    expect(w.networkRemovedUnits.has(attacker.id)).toBe(true);
   });
 });
