@@ -85,7 +85,7 @@ async function run(unitCount: number) {
   try {
     for (let tick = 0; tick < ticks; tick++) {
       const started = performance.now();
-      await world.tickWithRust(engine, 0.05, now);
+      await world.tickWithRust(engine, 0.05, now, false);
       const elapsed = performance.now() - started;
       if (tick >= warmupTicks) {
         samples.push(elapsed);

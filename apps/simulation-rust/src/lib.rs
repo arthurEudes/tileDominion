@@ -2,6 +2,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 
+mod serde_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        Vec::<u8>::deserialize(deserializer)
+    }
+}
+
 pub mod zoned_world;
 
 pub const CHUNK_SIZE: f32 = 16.0;
@@ -39,6 +51,19 @@ pub struct SimulationConfig {
     pub turret_damage: f32,
     pub turret_range: f32,
     pub turret_cooldown_ms: u64,
+    pub player_speed: f32,
+    pub speed_upgrade_bonus: f32,
+    pub capture_hold_ms: u64,
+    pub capture_improved_multiplier: f32,
+    pub respawn_invulnerability_ms: u64,
+    pub supply_update_interval_ms: u64,
+    pub supply_decay_ms: u64,
+    pub supply_decay_stages: u8,
+    pub supply_capital_radius: f32,
+    pub supply_relay_radius: f32,
+    pub income_interval_ms: u64,
+    pub income_per_tile: f32,
+    pub unsupplied_income_multiplier: f32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -58,7 +83,7 @@ impl UnitKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UnitState {
     pub id: u32,
     pub owner_id: u32,
@@ -110,6 +135,30 @@ pub struct HumanState {
     pub is_bot: bool,
     #[serde(default)]
     pub invulnerable_until: u64,
+    #[serde(default)]
+    pub hp: f32,
+    #[serde(default)]
+    pub max_hp: f32,
+    #[serde(default)]
+    pub money: f32,
+    #[serde(default)]
+    pub kills: u32,
+    #[serde(default)]
+    pub input_x: f32,
+    #[serde(default)]
+    pub input_y: f32,
+    #[serde(default)]
+    pub capture_tile: Option<u32>,
+    #[serde(default)]
+    pub capture_since: u64,
+    #[serde(default)]
+    pub speed_upgrade: u8,
+    #[serde(default)]
+    pub capture_upgrade: u8,
+    #[serde(default)]
+    pub capital_x: f32,
+    #[serde(default)]
+    pub capital_y: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -130,6 +179,7 @@ pub struct EngineRequest {
     pub protocol_version: u8,
     pub request_id: u32,
     pub now: u64,
+    pub dt: f32,
     pub detection_range: f32,
     pub intermediate_radius: f32,
     pub config: SimulationConfig,
@@ -145,6 +195,14 @@ pub struct EngineRequest {
     pub map_init: Option<MapInit>,
     #[serde(default)]
     pub tile_upserts: Vec<TileUpdate>,
+    #[serde(default)]
+    pub network_cells: Vec<(i16, i16, bool)>,
+    #[serde(default = "default_true")]
+    pub return_schedules: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -209,6 +267,18 @@ pub struct TickResponse {
     pub next_cursor: usize,
     #[serde(default)]
     pub events: Vec<SimulationEvent>,
+    #[serde(default)]
+    pub humans: Vec<HumanState>,
+    #[serde(default)]
+    pub network_zones: Vec<NetworkZoneDelta>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NetworkZoneDelta {
+    pub cell_x: i16,
+    pub cell_y: i16,
+    #[serde(with = "serde_bytes")]
+    pub frame: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -720,6 +790,8 @@ pub fn schedule_tick(request: &mut TickRequest) -> TickResponse {
             (start_index + visited) % unit_count
         },
         events: Vec::new(),
+        humans: Vec::new(),
+        network_zones: Vec::new(),
     }
 }
 
@@ -761,6 +833,18 @@ mod tests {
             alive: true,
             is_bot: false,
             invulnerable_until,
+            hp: 100.0,
+            max_hp: 100.0,
+            money: 0.0,
+            kills: 0,
+            input_x: 0.0,
+            input_y: 0.0,
+            capture_tile: None,
+            capture_since: 0,
+            speed_upgrade: 0,
+            capture_upgrade: 0,
+            capital_x: x,
+            capital_y: 10.0,
         }
     }
     fn config() -> SimulationConfig {
@@ -795,6 +879,19 @@ mod tests {
             turret_damage: 16.0,
             turret_range: 8.0,
             turret_cooldown_ms: 900,
+            player_speed: 5.2,
+            speed_upgrade_bonus: 0.08,
+            capture_hold_ms: 550,
+            capture_improved_multiplier: 0.88,
+            respawn_invulnerability_ms: 2500,
+            supply_update_interval_ms: 1000,
+            supply_decay_ms: 45_000,
+            supply_decay_stages: 9,
+            supply_capital_radius: 24.0,
+            supply_relay_radius: 12.0,
+            income_interval_ms: 1000,
+            income_per_tile: 0.12,
+            unsupplied_income_multiplier: 0.5,
         }
     }
     #[test]
@@ -1024,6 +1121,19 @@ mod tests {
         );
         assert_eq!(
             index.nearest_allied(2.5, 0.5, 10, &owners),
+            Some((1.5, 0.5))
+        );
+
+        // Ownership is read from the authoritative owner array, so a capture
+        // immediately inverts the same index query without rebuilding it.
+        owners[1] = 20;
+        owners[3] = 10;
+        assert_eq!(
+            index.nearest_allied(3.5, 0.5, 10, &owners),
+            Some((3.5, 0.5))
+        );
+        assert_eq!(
+            index.nearest_non_allied(3.5, 0.5, 10, &owners),
             Some((1.5, 0.5))
         );
     }

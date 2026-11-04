@@ -58,6 +58,7 @@ export class DominionRoom extends Room {
     }
   >();
   clientInterestCells = new Map<string, string>();
+  fullNetworkCells = new Set<string>();
   globalUnitIds = new Map<string, number>();
   nextGlobalUnitId = 1;
   minimapOwners: Array<string | null> = [];
@@ -68,6 +69,7 @@ export class DominionRoom extends Room {
       1000 / GAME.room.tickRate,
     );
     this.onMessage("ready", (c) => {
+      this.fullNetworkCells.add(this.interestCellFor(c.sessionId));
       this.sendFullInterestState(c);
       this.sendFullMinimap(c);
     });
@@ -198,13 +200,25 @@ export class DominionRoom extends Room {
     const now = Date.now();
     try {
       this.updateBots(now);
-      await this.world.tickWithRust(this.rust, Math.min(dt, 0.1), now);
+      const networkDue = this.elapsed + dt >= 0.1;
+      const cells = networkDue
+        ? new Set(this.clients.map((client) => this.interestCellFor(client.sessionId)))
+        : new Set<string>();
+      this.rust.setNetworkCells([...cells].map((cell) => {
+        const [x, y] = cell.split(",").map(Number);
+        const entrant = this.clients.some((client) =>
+          this.interestCellFor(client.sessionId) === cell &&
+          this.clientInterestCells.get(client.sessionId) !== cell);
+        return [x, y, this.fullNetworkCells.has(cell) || entrant] as [number, number, boolean];
+      }));
+      await this.world.tickWithRust(this.rust, Math.min(dt, 0.1), now, false);
       this.elapsed += dt;
       if (this.elapsed >= 0.1) {
         this.elapsed = 0;
         const changed = [...this.world.dirtyTiles],
           counts = this.world.allCounts();
         this.broadcastInterestStates(changed, counts);
+        this.fullNetworkCells.clear();
         this.world.dirtyTiles.clear();
       }
     } catch (error) {
@@ -498,15 +512,9 @@ export class DominionRoom extends Room {
     const cell = this.interestCellFor(client.sessionId),
       counts = this.world.allCounts(),
       snapshot = this.interestSnapshot(cell, true, [], counts),
-      temporaryChannel = `__full:${cell}`;
-    this.unitChannels.delete(temporaryChannel);
-    const wire = compactSnapshot(
-      snapshot,
-      this.unitDelta(temporaryChannel, snapshot.units, true),
-    );
-    this.unitChannels.delete(temporaryChannel);
+      wire = compactSnapshot(snapshot, [[], [], [], 0]);
+    client.sendBytes("unitIds", encode(this.rust.idMappings()));
     client.sendBytes("state", encode(wire));
-    this.clientInterestCells.set(client.sessionId, cell);
   }
   private broadcastInterestStates(
     changedTiles: string[],
@@ -519,40 +527,29 @@ export class DominionRoom extends Room {
       clients.push(client);
       groups.set(cell, clients);
     }
-    const activeChannels = new Set<string>();
+    const mappings = this.rust?.drainNewIdMappings?.() ?? [];
+    if (mappings.length) {
+      const bytes = encode(mappings);
+      for (const client of this.clients) client.sendBytes("unitIds", bytes);
+    }
     for (const [cell, clients] of groups) {
-      const channelId = `interest:${cell}`;
-      activeChannels.add(channelId);
-      const snapshot = this.interestSnapshot(cell, false, changedTiles, counts),
-        delta = this.unitDelta(channelId, snapshot.units),
-        deltaBytes = encode(compactSnapshot(snapshot, delta));
+      const unitFrame = this.world.rustNetworkZones.get(cell),
+        snapshot = this.interestSnapshot(cell, false, changedTiles, counts),
+        stateBytes = encode(compactSnapshot(snapshot, [[], [], [], 0]));
       const entrants = clients.filter(
         (client) => this.clientInterestCells.get(client.sessionId) !== cell,
       );
-      let fullBytes: Uint8Array | undefined;
-      if (entrants.length) {
-        const fullSnapshot = this.interestSnapshot(cell, true, [], counts),
-          temporaryChannel = `__full:${cell}`;
-        this.unitChannels.delete(temporaryChannel);
-        fullBytes = encode(
-          compactSnapshot(
-            fullSnapshot,
-            this.unitDelta(temporaryChannel, fullSnapshot.units, true),
-          ),
-        );
-        this.unitChannels.delete(temporaryChannel);
-      }
       for (const client of clients) {
-        client.sendBytes(
-          "state",
-          entrants.includes(client) ? fullBytes! : deltaBytes,
-        );
+        if (unitFrame) client.sendBytes("units", unitFrame);
+        const clientSnapshot = entrants.includes(client)
+          ? this.interestSnapshot(cell, true, [], counts)
+          : snapshot;
+        client.sendBytes("state", entrants.includes(client)
+          ? encode(compactSnapshot(clientSnapshot, [[], [], [], 0]))
+          : stateBytes);
         this.clientInterestCells.set(client.sessionId, cell);
       }
     }
-    for (const channelId of [...this.unitChannels.keys()])
-      if (channelId.startsWith("interest:") && !activeChannels.has(channelId))
-        this.unitChannels.delete(channelId);
     // Numeric IDs only have to remain stable while the unit exists. Keeping
     // every produced and destroyed unit here made long matches grow forever.
     for (const unitId of this.world.networkRemovedUnits)
@@ -652,12 +649,11 @@ export class DominionRoom extends Room {
       centerY = (cellY + 0.5) * INTEREST_CELL_SIZE,
       radius = GAME.map.unitInterestRadius + Math.SQRT2 * INTEREST_CELL_SIZE * 0.5,
       nearbyUnits = [...this.world.spatial.query(centerX, centerY, radius)].filter(
-        (entity): entity is Unit =>
-          "kind" in entity &&
-          Math.hypot(entity.x - centerX, entity.y - centerY) <= radius,
-      ),
-      units = nearbyUnits
-        .map((unit) => this.unitView(unit)),
+          (entity): entity is Unit =>
+            "kind" in entity &&
+            Math.hypot(entity.x - centerX, entity.y - centerY) <= radius,
+        ),
+      units: ServerUnitView[] = [],
       allPlayers = [...this.world.players.values()],
       visibleOwnerIds = new Set(nearbyUnits.map((unit) => unit.ownerId)),
       nearbyPlayers = allPlayers.filter(
@@ -749,6 +745,7 @@ export class DominionRoom extends Room {
     clientId: string,
     units: ServerUnitView[],
     full = false,
+    rustDelta?: { created: Unit[]; updated: Unit[]; removed: string[] },
   ): CompactUnitDelta {
     let channel = this.unitChannels.get(clientId);
     if (!channel) {
@@ -759,9 +756,11 @@ export class DominionRoom extends Room {
     const created: CompactUnitDelta[0] = [],
       updated: CompactUnitDelta[1] = [],
       removed: number[] = [],
-      visible = new Set<string>();
-    for (const unit of units) {
-      visible.add(unit.id);
+      visible = new Set(units.map((unit) => unit.id)),
+      candidates = !full && rustDelta
+        ? [...rustDelta.created, ...rustDelta.updated].map((unit) => this.unitView(unit))
+        : units;
+    for (const unit of candidates) {
       let numericId = channel.ids.get(unit.id);
       if (!numericId) {
         numericId = this.globalUnitId(unit.id);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Player, Unit } from "./model.js";
 import { RustEngine, rustExecutablePath } from "./rust-engine.js";
 import { GAME } from "@tile/game-config";
+import { decode } from "@msgpack/msgpack";
 
 describe("Rust engine executable", () => {
   it("uses the native executable name on Windows", () => {
@@ -64,6 +65,43 @@ describe("Rust engine executable", () => {
       expect(secondTick).toHaveLength(1);
       expect(secondTick[0].x).toBe(schedules[0].x);
       expect([secondTick[0].dir_x, secondTick[0].dir_y]).toEqual([0, 0]);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("returns client-ready opaque unit frames without mirrored schedules", async () => {
+    const engine = new RustEngine();
+    const robot = {
+      id: "opaque-unit", ownerId: "opaque-owner", kind: "robot",
+      x: 10.5, y: 11.5, hp: 45, dirX: 0, dirY: 0, order: "wander",
+      orderX: 10.5, orderY: 11.5, nextThink: 0, nextSimulationAt: 0,
+      lastSimulatedAt: 0, cachedTargetId: "", cachedTargetUntil: 0,
+    } as Unit;
+    try {
+      engine.setNetworkCells([[0, 0, true]]);
+      const result = await engine.scheduleDeltaWithEvents(
+        1000,
+        [robot],
+        [],
+        [],
+        [],
+        undefined,
+        [],
+        undefined,
+        undefined,
+        false,
+      );
+      expect(result.schedules).toEqual([]);
+      expect(result.networkZones).toHaveLength(1);
+      expect(result.networkZones[0].frame).toBeInstanceOf(Uint8Array);
+      const frame = decode(result.networkZones[0].frame) as [unknown[], unknown[], unknown[], boolean];
+      expect(frame[0]).toHaveLength(1);
+      expect(frame[3]).toBe(true);
+      expect(engine.idMappings()).toEqual(expect.arrayContaining([
+        expect.arrayContaining([expect.any(Number), robot.id]),
+        expect.arrayContaining([expect.any(Number), robot.ownerId]),
+      ]));
     } finally {
       engine.close();
     }
@@ -139,6 +177,38 @@ describe("Rust engine executable", () => {
       const resumed = await engine.scheduleDeltaWithEvents(10000, [], [], [], []);
       const schedule = resumed.schedules.find(({ id }) => id === robot.id)!;
       expect(Math.hypot(schedule.x - robot.x, schedule.y - robot.y)).toBeGreaterThan(0);
+    } finally {
+      engine.close();
+    }
+  });
+
+  it("moves players and completes their captures authoritatively in Rust", async () => {
+    const engine = new RustEngine(),
+      map = new Map<string, { owner: string | null; obstacle: boolean }>([
+        ["10,10", { owner: null, obstacle: false }],
+      ]),
+      player = {
+        id: "player-rust", name: "Rust", x: 10.5, y: 10.5,
+        color: 1, hp: 100, maxHp: 100, money: 0, kills: 0,
+        alive: true, isBot: false,
+        input: { x: 0, y: 0, attack: false, seq: 1 },
+        captureKey: "", captureSince: 0, lastAttack: 0,
+        invulnerableUntil: 0,
+        upgrades: { speed: 0, armor: 0, capture: 0 },
+      } satisfies Player;
+    try {
+      const first = await engine.scheduleDeltaWithEvents(
+        1000, [], [], [player], [], map,
+      );
+      expect(first.players[0].captureKey).toBe("10,10");
+      player.captureKey = first.players[0].captureKey;
+      player.captureSince = first.players[0].captureSince;
+      const second = await engine.scheduleDeltaWithEvents(
+        1600, [], [], [player], [], map,
+      );
+      expect(second.events).toContainEqual(expect.objectContaining({
+        kind: 0, ownerId: player.id, tileIndex: 10 * GAME.map.width + 10,
+      }));
     } finally {
       engine.close();
     }
@@ -253,7 +323,7 @@ describe("Rust engine executable", () => {
     }
   });
 
-  it("lets defenders cross the border by seven tiles only while pursuing", async () => {
+  it("lets defenders leave allied territory for a target then return", async () => {
     const engine = new RustEngine(),
       map = new Map([["10,10", { owner: "p1", obstacle: false }]]),
       defender = {
@@ -277,29 +347,18 @@ describe("Rust engine executable", () => {
       expect(sortie.target_id).toBe(enemy.id);
       expect(sortie.x).toBeGreaterThan(11);
 
-      Object.assign(defender, {
-        x: 18,
-        y: 10.5,
-        dirX: 1,
-        dirY: 0,
-        nextSimulationAt: 0,
-        lastSimulatedAt: 1000,
-        cachedTargetId: enemy.id,
-        cachedTargetUntil: 5000,
-      });
-      enemy.x = 18.5;
-      enemy.y = 10.5;
-      enemy.nextSimulationAt = Number.MAX_SAFE_INTEGER;
-      const second = await engine.schedule(1500, [defender, enemy], []),
-        returned = second.find(({ id }) => id === defender.id)!;
+      const second = await engine.scheduleDeltaWithEvents(
+          1500, [], [enemy.id], [], [],
+        ),
+        returned = second.schedules.find(({ id }) => id === defender.id)!;
       expect(returned.target_id).toBeNull();
-      expect(returned.x).toBeLessThan(defender.x);
+      expect(returned.x).toBeLessThan(sortie.x);
     } finally {
       engine.close();
     }
   });
 
-  it("keeps a defender moving when it reaches its patrol leash", async () => {
+  it("lets a defender patrol beyond its former leash on allied territory", async () => {
     const engine = new RustEngine(),
       map = new Map<string, { owner: string | null; obstacle: boolean }>();
     for (let x = 10; x <= 22; x++)
@@ -314,8 +373,8 @@ describe("Rust engine executable", () => {
     } as Unit;
     try {
       const [schedule] = await engine.schedule(1000, [defender], [], map);
-      expect(schedule.x).toBeLessThan(defender.x);
-      expect(schedule.dir_x).toBeLessThan(0);
+      expect(schedule.x).toBeGreaterThan(defender.x);
+      expect(schedule.dir_x).toBeGreaterThan(0);
     } finally {
       engine.close();
     }

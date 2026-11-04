@@ -397,7 +397,7 @@ describe("authoritative rules", () => {
     w.tickUnit(defender, 0.5, 2000);
     expect(defender.dirX).toBeLessThan(0);
   });
-  it("lets defenders sortie seven tiles for a target then sends them home", () => {
+  it("lets defenders leave allied territory for a target then return", () => {
     const w = world(),
       owner = w.addPlayer("owner", "Owner", 1),
       enemy = w.addPlayer("enemy", "Enemy", 2);
@@ -426,19 +426,16 @@ describe("authoritative rules", () => {
     w.spatial.rebuild(w.players.values(), w.units.values());
     w.tickUnit(defender, 0.5, 1000);
     expect(defender.x).toBeGreaterThan(11);
-    expect(w.map.get(key(Math.floor(defender.x), 10))?.owner).not.toBe(owner.id);
+    expect(w.map.get(key(Math.floor(defender.x), Math.floor(defender.y)))?.owner)
+      .not.toBe(owner.id);
 
-    defender.x = 18;
-    defender.y = 10.5;
-    defender.nextThink = 0;
-    robot.x = 18.5;
-    robot.y = 10.5;
+    const sortieX = defender.x;
+    w.units.delete(robot.id);
     w.spatial.rebuild(w.players.values(), w.units.values());
-    w.tickUnit(defender, 0.1, 2000);
-    expect(defender.dirX).toBeLessThan(0);
-    expect(defender.cachedTargetId).toBe("");
+    w.tickUnit(defender, 0.5, 2000);
+    expect(defender.x).toBeLessThan(sortieX);
   });
-  it("turns defenders back before the invisible patrol edge can pin them", () => {
+  it("lets defenders patrol beyond the former invisible edge", () => {
     const w = world(),
       owner = w.addPlayer("owner", "Owner", 1);
     owner.money = 999;
@@ -462,8 +459,8 @@ describe("authoritative rules", () => {
     const before = defender.x;
     w.spatial.rebuild(w.players.values(), w.units.values());
     w.tickUnit(defender, 0.5, 1000);
-    expect(defender.x).toBeLessThan(before);
-    expect(defender.dirX).toBeLessThan(0);
+    expect(defender.x).toBeGreaterThan(before);
+    expect(defender.dirX).toBeGreaterThan(0);
   });
   it("holds a defender still while its nearby target is in range", () => {
     const w = world(),

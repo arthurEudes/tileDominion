@@ -1,6 +1,6 @@
 import { decode } from "@msgpack/msgpack";
 import { describe, expect, it } from "vitest";
-import { expandSnapshot, type CompactSnapshot, type UnitView } from "@tile/protocol";
+import { type CompactSnapshot } from "@tile/protocol";
 import { DominionRoom } from "./room.js";
 import { World } from "./world.js";
 import type { Client } from "colyseus";
@@ -57,28 +57,29 @@ describe("shared spatial interest channels", () => {
     room.world.spawnProducedUnit(b.id, "robot", 300, 300);
     room.world.spatial.rebuild(room.world.players.values(), room.world.units.values());
 
-    const received = new Map<string, Uint8Array>();
+    const state = new Map<string, Uint8Array>(), units = new Map<string, Uint8Array>();
+    const rustFrame = new Uint8Array([1, 2, 3]);
+    room.world.rustNetworkZones.set("1,1", rustFrame);
     const clients = ["a", "b"].map(
       (sessionId) =>
         ({
           sessionId,
-          sendBytes: (_type: string, bytes: Uint8Array) => received.set(sessionId, bytes),
+          sendBytes: (type: string, bytes: Uint8Array) =>
+            (type === "units" ? units : state).set(sessionId, bytes),
         }) as unknown as Client,
     );
     Object.defineProperty(room, "clients", { value: clients });
+    room.clientInterestCells.set("a", "1,1");
+    room.clientInterestCells.set("b", "1,1");
 
     (room as unknown as {
       broadcastInterestStates(changed: string[]): void;
     }).broadcastInterestStates([]);
 
-    expect(received.get("a")).toBe(received.get("b"));
-    const units = new Map<number, UnitView>(),
-      snapshot = expandSnapshot(
-        decode(received.get("a")!) as CompactSnapshot,
-        units,
-      );
-    expect(snapshot.units.some((unit) => unit.x === 26)).toBe(true);
-    expect(snapshot.units.some((unit) => unit.x === 300)).toBe(false);
+    expect(state.get("a")).toBe(state.get("b"));
+    expect(units.get("a")).toBe(rustFrame);
+    expect(units.get("b")).toBe(rustFrame);
+    expect((decode(state.get("a")!) as CompactSnapshot)[5]).toEqual([[], [], [], 0]);
   });
 
   it("includes the owner metadata for every visible AI unit", () => {
@@ -96,17 +97,17 @@ describe("shared spatial interest channels", () => {
 
     const snapshot = (room as unknown as {
       interestSnapshot(cell: string, full: boolean, tiles: string[]): {
-        units: UnitView[];
+        units: unknown[];
         players: Array<{ id: string; color: number }>;
       };
     }).interestSnapshot("1,1", false, []);
-    expect(snapshot.units.some(({ ownerId }) => ownerId === bot.id)).toBe(true);
+    expect(snapshot.units).toHaveLength(0);
     expect(snapshot.players).toContainEqual(expect.objectContaining({
       id: bot.id, color: bot.color,
     }));
   });
 
-  it("sends a purchased attacker through the next tile-free delta", () => {
+  it("forwards Rust unit frames without decoding or re-encoding them", () => {
     const room = Object.create(DominionRoom.prototype) as DominionRoom;
     room.world = new World();
     room.unitChannels = new Map();
@@ -121,50 +122,18 @@ describe("shared spatial interest channels", () => {
       room.world.units.values(),
     );
 
-    const received: Uint8Array[] = [],
+    const received: Array<[string, Uint8Array]> = [],
       client = {
         sessionId: player.id,
-        sendBytes: (_type: string, bytes: Uint8Array) => received.push(bytes),
+        sendBytes: (type: string, bytes: Uint8Array) => received.push([type, bytes]),
       } as unknown as Client;
     Object.defineProperty(room, "clients", { value: [client] });
+    const frame = new Uint8Array([0x94, 0x90, 0x90, 0x90, 0xc2]);
+    room.world.rustNetworkZones.set("1,1", frame);
     (room as unknown as { broadcastInterestStates(changed: string[]): void })
       .broadcastInterestStates([]);
-    received.length = 0;
-
-    expect(room.world.buy(player.id, "attacker")).toBe(true);
-    room.world.spatial.rebuild(
-      room.world.players.values(),
-      room.world.units.values(),
-    );
-    (room as unknown as { broadcastInterestStates(changed: string[]): void })
-      .broadcastInterestStates([]);
-
-    const units = new Map<number, UnitView>(),
-      snapshot = expandSnapshot(
-        decode(received[0]) as CompactSnapshot,
-        units,
-      );
-    expect(snapshot.tiles).toHaveLength(0);
-    expect(snapshot.unitDelta.created).toHaveLength(1);
-    expect(snapshot.units.some((unit) => unit.kind === "attacker")).toBe(true);
-    expect(received[0].byteLength).toBeLessThan(2_000);
-
-    const attacker = [...room.world.units.values()].find(
-      (unit) => unit.kind === "attacker",
-    )!;
-    room.world.damageUnit(attacker, attacker.hp + 1);
-    room.world.spatial.rebuild(
-      room.world.players.values(),
-      room.world.units.values(),
-    );
-    received.length = 0;
-    (room as unknown as { broadcastInterestStates(changed: string[]): void })
-      .broadcastInterestStates([]);
-    const removal = expandSnapshot(
-      decode(received[0]) as CompactSnapshot,
-      units,
-    );
-    expect(removal.unitDelta.removed).toEqual(snapshot.unitDelta.created);
-    expect(room.globalUnitIds.has(attacker.id)).toBe(false);
+    expect(received.find(([type]) => type === "units")?.[1]).toBe(frame);
+    const state = decode(received.find(([type]) => type === "state")![1]) as CompactSnapshot;
+    expect(state[5]).toEqual([[], [], [], 0]);
   });
 });

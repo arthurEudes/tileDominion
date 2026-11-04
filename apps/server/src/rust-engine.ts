@@ -4,8 +4,8 @@ import { decode, encode } from "@msgpack/msgpack";
 import { GAME } from "@tile/game-config";
 import type { Player, Unit } from "./model.js";
 
-export const RUST_PROTOCOL_VERSION = 4;
-const DEFAULT_REQUEST_TIMEOUT_MS = 100;
+export const RUST_PROTOCOL_VERSION = 6;
+const DEFAULT_REQUEST_TIMEOUT_MS = 500;
 
 export function rustExecutablePath(platform = process.platform) {
   const filename = `tile-dominion-simulation${platform === "win32" ? ".exe" : ""}`;
@@ -47,6 +47,15 @@ export type RustSimulationEvent = {
 export type RustTickResult = {
   schedules: RustSchedule[];
   events: RustSimulationEvent[];
+  players: Array<{
+    id: string; x: number; y: number; alive: boolean; hp: number;
+    money: number; kills: number; invulnerableUntil: number;
+    captureKey: string; captureSince: number;
+  }>;
+  networkZones: Array<{
+    cell: string;
+    frame: Uint8Array;
+  }>;
 };
 
 export type RustTransportMetrics = {
@@ -75,9 +84,11 @@ export class RustEngine {
   private nextNumericId = 1;
   private idNumbers = new Map<string, number>();
   private stringIds = new Map<number, string>();
+  private newIdMappings: Array<[number, string]> = [];
   private legacyUnits = new Set<string>();
   private legacyHumans = new Set<string>();
   private nextRequestId = 1;
+  private networkCells: Array<[number, number, boolean]> = [];
   readonly transportMetrics: RustTransportMetrics = {
     inFlight: 0,
     peakInFlight: 0,
@@ -100,16 +111,7 @@ export class RustEngine {
         const frame = this.output.subarray(4, length + 4);
         this.output = this.output.subarray(length + 4);
         try {
-          const [requestId, wireSchedules, wireMetrics, , wireEvents] = decode(frame) as [
-            number,
-            Array<[
-              number, number, number, number | null, number,
-              number, number, number, number, number, number,
-            ]>,
-            [number, number, number, number] | null,
-            number,
-            Array<[number, number, number, number, number, number]>,
-          ];
+          const [requestId, wireSchedules, wireMetrics, , wireEvents, wirePlayers, wireZones] = decode(frame) as any[];
           const pending = this.pending.get(requestId);
           if (!pending) {
             this.transportMetrics.orphanedResponses++;
@@ -129,7 +131,7 @@ export class RustEngine {
               }
             : undefined;
           pending.resolve({
-            schedules: wireSchedules.map((schedule) => ({
+            schedules: wireSchedules.map((schedule: any[]) => ({
               id: this.stringIds.get(schedule[0])!,
               dt: schedule[1],
               interval_ms: schedule[2],
@@ -145,13 +147,25 @@ export class RustEngine {
               next_think: schedule[9],
               last_attack: schedule[10],
             })),
-            events: (wireEvents ?? []).map((event) => ({
+            events: (wireEvents ?? []).map((event: any[]) => ({
               kind: event[0],
               entityId: this.stringIds.get(event[1]) ?? null,
               targetId: this.stringIds.get(event[2]) ?? null,
               tileIndex: event[3],
               amount: event[4],
               ownerId: this.stringIds.get(event[5]) ?? null,
+            })),
+            players: (wirePlayers ?? []).map((player: any[]) => ({
+              id: this.stringIds.get(player[0])!, x: player[1], y: player[2],
+              alive: player[3], invulnerableUntil: player[5], hp: player[6],
+              money: player[8], kills: player[9],
+              captureKey: player[12] === null ? "" :
+                `${player[12] % GAME.map.width},${Math.floor(player[12] / GAME.map.width)}`,
+              captureSince: player[13],
+            })),
+            networkZones: (wireZones ?? []).map((zone: any[]) => ({
+              cell: `${zone[0]},${zone[1]}`,
+              frame: zone[2] as Uint8Array,
             })),
           });
         } catch (error) {
@@ -224,6 +238,9 @@ export class RustEngine {
     humanRemovals: Iterable<string>,
     map?: TileMap,
     dirtyTiles: Iterable<string> = [],
+    dt = 1 / GAME.room.tickRate,
+    capitals?: ReadonlyMap<string, { x: number; y: number }>,
+    returnSchedules = true,
   ) {
     const removedUnitIds = [...unitRemovals],
       removedHumanIds = [...humanRemovals];
@@ -264,6 +281,7 @@ export class RustEngine {
       RUST_PROTOCOL_VERSION,
       requestId,
       now,
+      dt,
       GAME.units.soldier.detectionRange,
       GAME.simulation.intermediateRadius,
       [
@@ -297,13 +315,28 @@ export class RustEngine {
         GAME.units.bastion.turretDamage,
         GAME.units.bastion.turretRange,
         GAME.units.bastion.turretCooldownMs,
+        GAME.player.speed,
+        GAME.upgrades.speed.bonus,
+        GAME.capture.holdMs,
+        GAME.capture.improvedMultiplier,
+        GAME.player.respawnInvulnerabilityMs,
+        GAME.supply.updateIntervalMs,
+        GAME.supply.decayMs,
+        GAME.supply.decayStages,
+        GAME.supply.headquartersRadius,
+        GAME.supply.relayRadius,
+        GAME.economy.incomeIntervalMs,
+        GAME.economy.incomePerTile,
+        GAME.supply.unsuppliedIncomeMultiplier,
       ],
       [...unitUpserts].map((unit) => this.unitTuple(unit)),
       removedUnitIds.map((id) => this.idFor(id)),
-      [...humanUpserts].map((player) => this.humanTuple(player)),
+      [...humanUpserts].map((player) => this.humanTuple(player, capitals?.get(player.id))),
       removedHumanIds.map((id) => this.idFor(id)),
       mapInit,
       tileUpserts,
+      this.networkCells,
+      returnSchedules,
     ];
     if (map) this.mapInitialized = true;
     return this.send(requestId, request).then((result) => {
@@ -319,6 +352,18 @@ export class RustEngine {
 
   invalidateMap() {
     this.mapInitialized = false;
+  }
+
+  setNetworkCells(cells: Array<[number, number, boolean]>) {
+    this.networkCells = cells;
+  }
+
+  idMappings() {
+    return [...this.stringIds.entries()];
+  }
+
+  drainNewIdMappings() {
+    return this.newIdMappings.splice(0);
   }
 
   private send(requestId: number, request: unknown) {
@@ -403,10 +448,17 @@ export class RustEngine {
     ];
   }
 
-  private humanTuple(player: Player) {
+  private humanTuple(player: Player, capital?: { x: number; y: number }) {
     return [
       this.idFor(player.id), player.x, player.y,
       player.alive, player.isBot, player.invulnerableUntil,
+      player.hp ?? GAME.player.maxHp, player.maxHp ?? GAME.player.maxHp,
+      player.money ?? 0, player.kills ?? 0,
+      player.input?.x ?? 0, player.input?.y ?? 0,
+      player.captureKey ? this.tileIndex(player.captureKey) : null,
+      player.captureSince ?? 0, player.upgrades?.speed ?? 0,
+      player.upgrades?.capture ?? 0,
+      capital?.x ?? player.x, capital?.y ?? player.y,
     ];
   }
 
@@ -416,6 +468,7 @@ export class RustEngine {
     const numeric = this.nextNumericId++;
     this.idNumbers.set(id, numeric);
     this.stringIds.set(numeric, id);
+    this.newIdMappings.push([numeric, id]);
     return numeric;
   }
 

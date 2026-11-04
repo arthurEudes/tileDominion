@@ -5,49 +5,10 @@ use std::{
     time::Instant,
 };
 use tile_dominion_simulation::{
-    EngineMetrics, EngineRequest, HumanState, SimulationEvent, TickRequest, TickResponse,
-    TileTargetIndex, UnitKind, choose_wander_direction, schedule_tick,
+    EngineMetrics, EngineRequest, HumanState, NetworkZoneDelta, SimulationEvent, TickRequest,
+    TickResponse, TileTargetIndex, UnitKind, choose_wander_direction, schedule_tick,
     zoned_world::{ZoneKey, ZonedWorld},
 };
-
-fn nearest_allied_within(
-    x: f32,
-    y: f32,
-    owner_id: u32,
-    radius: f32,
-    map_width: u32,
-    map_height: u32,
-    tile_owners: &[u32],
-) -> Option<(f32, f32, f32)> {
-    if map_width == 0 || map_height == 0 {
-        return None;
-    }
-    let radius_tiles = radius.ceil() as i32;
-    let center_x = x.floor() as i32;
-    let center_y = y.floor() as i32;
-    let mut nearest = None::<(f32, f32, f32)>;
-    for tile_y in (center_y - radius_tiles).max(0)
-        ..=(center_y + radius_tiles).min(map_height as i32 - 1)
-    {
-        for tile_x in (center_x - radius_tiles).max(0)
-            ..=(center_x + radius_tiles).min(map_width as i32 - 1)
-        {
-            let index = tile_y as u32 * map_width + tile_x as u32;
-            if tile_owners.get(index as usize).copied() != Some(owner_id) {
-                continue;
-            }
-            let allied_x = tile_x as f32 + 0.5;
-            let allied_y = tile_y as f32 + 0.5;
-            let distance = ((x - allied_x).powi(2) + (y - allied_y).powi(2)).sqrt();
-            if distance <= radius
-                && nearest.is_none_or(|(_, _, best_distance)| distance < best_distance)
-            {
-                nearest = Some((allied_x, allied_y, distance));
-            }
-        }
-    }
-    nearest
-}
 
 fn main() {
     let mut stdin = io::stdin().lock();
@@ -60,6 +21,12 @@ fn main() {
     let mut tile_owners = Vec::<u32>::new();
     let mut tile_targets = TileTargetIndex::default();
     let mut schedule_cursors = HashMap::<ZoneKey, usize>::new();
+    let mut tile_unsupplied_since = Vec::<u64>::new();
+    let mut tile_supply_stage = Vec::<u8>::new();
+    let mut last_supply_update = 0_u64;
+    let mut last_income_update = 0_u64;
+    let mut network_previous =
+        HashMap::<(i16, i16), HashMap<u32, tile_dominion_simulation::UnitState>>::new();
     loop {
         let mut length_bytes = [0_u8; 4];
         if stdin.read_exact(&mut length_bytes).is_err() {
@@ -78,14 +45,21 @@ fn main() {
             break;
         };
         let decode_us = decode_started.elapsed().as_micros() as u64;
-        if request.protocol_version != 4 {
+        if request.protocol_version != 6 {
             break;
         }
         let sync_started = Instant::now();
-        units.apply_delta(
-            std::mem::take(&mut request.unit_upserts),
-            std::mem::take(&mut request.unit_removals),
-        );
+        if request.return_schedules {
+            units.apply_delta(
+                std::mem::take(&mut request.unit_upserts),
+                std::mem::take(&mut request.unit_removals),
+            );
+        } else {
+            units.apply_authoritative_delta(
+                std::mem::take(&mut request.unit_upserts),
+                std::mem::take(&mut request.unit_removals),
+            );
+        }
         for id in request.human_removals {
             humans.remove(&id);
         }
@@ -97,6 +71,8 @@ fn main() {
             map_height = map.height;
             obstacles = map.obstacles.into_iter().collect();
             tile_owners = map.owners;
+            tile_unsupplied_since.resize(tile_owners.len(), 0);
+            tile_supply_stage.resize(tile_owners.len(), 0);
             tile_targets.rebuild(map_width, map_height, &obstacles);
         }
         for tile in request.tile_upserts {
@@ -121,15 +97,82 @@ fn main() {
                 y * map_width + x
             })
             .collect::<HashSet<_>>();
+        let mut player_events = Vec::<SimulationEvent>::new();
+        for human in humans.values_mut() {
+            if !human.alive {
+                continue;
+            }
+            let length = (human.input_x * human.input_x + human.input_y * human.input_y)
+                .sqrt()
+                .max(1.0);
+            let speed = request.config.player_speed
+                * (1.0 + f32::from(human.speed_upgrade) * request.config.speed_upgrade_bonus);
+            let dx = human.input_x / length * speed * request.dt;
+            let dy = human.input_y / length * speed * request.dt;
+            let candidate_x = (human.x + dx).clamp(0.1, request.config.map_width - 0.1);
+            let candidate_y = (human.y + dy).clamp(0.1, request.config.map_height - 0.1);
+            let blocked = |x: f32, y: f32| {
+                let index = y.floor() as u32 * map_width + x.floor() as u32;
+                obstacles.contains(&index) || wall_obstacles.contains(&index)
+            };
+            if !blocked(candidate_x, human.y) {
+                human.x = candidate_x;
+            }
+            if !blocked(human.x, candidate_y) {
+                human.y = candidate_y;
+            }
+            if map_width == 0 || map_height == 0 {
+                continue;
+            }
+            let tile_index = human.y.floor() as u32 * map_width + human.x.floor() as u32;
+            let owner = tile_owners
+                .get(tile_index as usize)
+                .copied()
+                .unwrap_or_default();
+            if owner != human.id && !obstacles.contains(&tile_index) {
+                if human.capture_tile != Some(tile_index) {
+                    human.capture_tile = Some(tile_index);
+                    human.capture_since = request.now;
+                } else {
+                    let duration = (request.config.capture_hold_ms as f32
+                        * if owner == 0 {
+                            1.0
+                        } else {
+                            request.config.enemy_capture_multiplier
+                        }
+                        * request
+                            .config
+                            .capture_improved_multiplier
+                            .powi(i32::from(human.capture_upgrade)))
+                        as u64;
+                    if request.now.saturating_sub(human.capture_since) >= duration {
+                        if let Some(tile_owner) = tile_owners.get_mut(tile_index as usize) {
+                            *tile_owner = human.id;
+                        }
+                        human.capture_tile = None;
+                        player_events.push(SimulationEvent {
+                            kind: 0,
+                            entity_id: human.id,
+                            target_id: 0,
+                            tile_index,
+                            amount: 0.0,
+                            owner_id: human.id,
+                        });
+                    }
+                }
+            } else {
+                human.capture_tile = None;
+            }
+        }
         let config = request.config.clone();
         let mut scheduler_config = request.config.clone();
         scheduler_config.tick_budget_us = scheduler_config.tick_budget_us.saturating_mul(3) / 4;
-        units.rebuild_ghosts(request.detection_range);
+        units.refresh_ghosts(request.detection_range);
         let human_snapshot = humans.values().cloned().collect::<Vec<_>>();
-        let unit_snapshot = units
+        let unit_targets = units
             .units()
-            .map(|unit| (unit.id, unit.clone()))
-            .collect::<HashMap<_, _>>();
+            .map(|unit| (unit.id, unit.owner_id, unit.hp, unit.x, unit.y))
+            .collect::<Vec<_>>();
         let zone_inputs = units
             .zones()
             .map(|zone| {
@@ -139,13 +182,17 @@ fn main() {
                     .map(|unit| unit.id)
                     .collect::<HashSet<_>>();
                 let mut visible = zone.units.clone();
-                visible.extend(zone.ghosts.iter().map(|ghost| ghost.state.clone()));
+                visible.extend(
+                    zone.ghosts
+                        .iter()
+                        .filter_map(|ghost| units.get(&ghost.id).cloned()),
+                );
                 // A target already acquired remains visible to its attacker until the
                 // scheduler releases the lock, even after crossing a zone halo.
                 // Only those explicit cross-zone dependencies are copied here.
                 for target_id in zone.units.iter().filter_map(|unit| unit.cached_target_id) {
                     if !visible.iter().any(|unit| unit.id == target_id) {
-                        if let Some(target) = unit_snapshot.get(&target_id) {
+                        if let Some(target) = units.get(&target_id) {
                             visible.push(target.clone());
                         }
                     }
@@ -185,6 +232,8 @@ fn main() {
             metrics: None,
             next_cursor: 0,
             events: Vec::new(),
+            humans: Vec::new(),
+            network_zones: Vec::new(),
         };
         for (key, result) in zone_results {
             schedule_cursors.insert(key, result.next_cursor);
@@ -193,18 +242,11 @@ fn main() {
         schedule_cursors.retain(|key, _| units.zones().any(|zone| zone.key == *key));
         let schedule_us = schedule_started.elapsed().as_micros() as u64;
         let movement_started = Instant::now();
-        let mut events = Vec::<SimulationEvent>::new();
-        let mut allied_tiles_by_owner = HashMap::<u32, Vec<(f32, f32)>>::new();
-        for (index, owner_id) in tile_owners.iter().copied().enumerate() {
-            if owner_id == 0 || map_width == 0 {
-                continue;
-            }
-            allied_tiles_by_owner.entry(owner_id).or_default().push((
-                (index as u32 % map_width) as f32 + 0.5,
-                (index as u32 / map_width) as f32 + 0.5,
-            ));
-        }
-        let mut defender_return_cache = HashMap::<(u32, u32, u32), (f32, f32)>::new();
+        let mut events = player_events;
+        // Robots and returning defenders query the same territorial index with
+        // opposite ownership predicates. Cache both hits and misses per owner
+        // and tile bucket so nearby defenders share one indexed lookup.
+        let mut defender_return_cache = HashMap::<(u32, u32, u32), Option<(f32, f32)>>::new();
         let produced_by_bastion = units
             .units()
             .filter_map(|unit| unit.source_bastion_id)
@@ -239,8 +281,11 @@ fn main() {
                 let y = unit.y.floor().clamp(0.0, map_height as f32 - 1.0) as u32;
                 tile_owners.get((y * map_width + x) as usize).copied() == Some(unit.owner_id)
             });
+            let defender_pursuing = units
+                .get(&schedule.id)
+                .is_some_and(|unit| unit.kind == UnitKind::Defender && target_state.is_some());
             let defender_return_target = units.get(&schedule.id).and_then(|unit| {
-                if unit.kind != UnitKind::Defender || defender_started_allied {
+                if unit.kind != UnitKind::Defender || defender_started_allied || defender_pursuing {
                     return None;
                 }
                 let cache_key = (
@@ -249,42 +294,13 @@ fn main() {
                     unit.y.max(0.0) as u32 / 8,
                 );
                 if let Some(target) = defender_return_cache.get(&cache_key) {
-                    return Some(*target);
+                    return *target;
                 }
-                let target = allied_tiles_by_owner
-                    .get(&unit.owner_id)?
-                    .iter()
-                    .copied()
-                    .min_by(|a, b| {
-                        let distance_a = (a.0 - unit.x).powi(2) + (a.1 - unit.y).powi(2);
-                        let distance_b = (b.0 - unit.x).powi(2) + (b.1 - unit.y).powi(2);
-                        distance_a.total_cmp(&distance_b)
-                    })?;
+                let target =
+                    tile_targets.nearest_allied(unit.x, unit.y, unit.owner_id, &tile_owners);
                 defender_return_cache.insert(cache_key, target);
-                Some(target)
+                target
             });
-            let (defender_home_distance, defender_sortie_anchor) = units
-                .get(&schedule.id)
-                .filter(|unit| unit.kind == UnitKind::Defender)
-                .map(|unit| {
-                    let home_distance =
-                        ((unit.x - unit.order_x).powi(2) + (unit.y - unit.order_y).powi(2)).sqrt();
-                    let sortie_anchor = nearest_allied_within(
-                        unit.x,
-                        unit.y,
-                        unit.owner_id,
-                        config.defender_sortie_margin,
-                        map_width,
-                        map_height,
-                        &tile_owners,
-                    );
-                    (home_distance, sortie_anchor)
-                })
-                .unwrap_or((0.0, None));
-            let defender_can_sortie = target_state.is_some()
-                && defender_home_distance
-                    <= config.defender_guard_radius + config.defender_sortie_margin
-                && defender_sortie_anchor.is_some();
             if let Some(unit) = units.get_mut(&schedule.id) {
                 unit.last_simulated_at = request.now;
                 unit.next_simulation_at = schedule.next_simulation_at;
@@ -296,12 +312,11 @@ fn main() {
                 };
                 if unit.kind.is_combat() {
                     let mut directed = false;
-                    let defender_must_return = unit.kind == UnitKind::Defender
-                        && !defender_can_sortie
-                        && (!defender_started_allied
-                            || defender_home_distance > config.defender_guard_radius);
-                    let defender_return_position = if defender_must_return {
-                        defender_return_target.or(Some((unit.order_x, unit.order_y)))
+                    let defender_return_position = if unit.kind == UnitKind::Defender
+                        && !defender_started_allied
+                        && !defender_pursuing
+                    {
+                        defender_return_target
                     } else {
                         None
                     };
@@ -315,9 +330,7 @@ fn main() {
                         unit.dir_y = dy / distance;
                         unit.next_think = request.now + 200;
                         directed = true;
-                    } else if let Some((target_x, target_y, _, _)) = target_state
-                        .filter(|_| unit.kind != UnitKind::Defender || defender_can_sortie)
-                    {
+                    } else if let Some((target_x, target_y, _, _)) = target_state {
                         let dx = target_x - unit.x;
                         let dy = target_y - unit.y;
                         let distance = (dx * dx + dy * dy).sqrt();
@@ -338,19 +351,6 @@ fn main() {
                             unit.next_think = request.now + 200;
                             directed = true;
                         }
-                    }
-                    if unit.kind == UnitKind::Defender
-                        && !defender_can_sortie
-                        && !directed
-                        && defender_home_distance >= config.defender_guard_radius * 0.85
-                    {
-                        let dx = unit.order_x - unit.x;
-                        let dy = unit.order_y - unit.y;
-                        let distance = (dx * dx + dy * dy).sqrt().max(0.001);
-                        unit.dir_x = dx / distance;
-                        unit.dir_y = dy / distance;
-                        unit.next_think = request.now + 200;
-                        directed = true;
                     }
                     if !directed {
                         let destination = match unit.order.as_str() {
@@ -408,19 +408,21 @@ fn main() {
                     && request.now.saturating_sub(unit.last_attack) >= config.turret_cooldown_ms
                 {
                     let mut nearest = None::<(u32, f32)>;
-                    for target in unit_snapshot.values() {
-                        if target.id == unit.id
-                            || target.owner_id == unit.owner_id
-                            || target.hp <= 0.0
+                    for &(target_id, target_owner_id, target_hp, target_x, target_y) in
+                        &unit_targets
+                    {
+                        if target_id == unit.id
+                            || target_owner_id == unit.owner_id
+                            || target_hp <= 0.0
                         {
                             continue;
                         }
                         let distance =
-                            ((target.x - unit.x).powi(2) + (target.y - unit.y).powi(2)).sqrt();
+                            ((target_x - unit.x).powi(2) + (target_y - unit.y).powi(2)).sqrt();
                         if distance <= config.turret_range
                             && nearest.is_none_or(|(_, best)| distance < best)
                         {
-                            nearest = Some((target.id, distance));
+                            nearest = Some((target_id, distance));
                         }
                     }
                     for target in &human_snapshot {
@@ -549,30 +551,13 @@ fn main() {
                         let candidate_owner = tile_owners
                             .get((tile_y * map_width + tile_x) as usize)
                             .copied();
-                        let defender_leash = if defender_can_sortie {
-                            config.defender_guard_radius + config.defender_sortie_margin
-                        } else {
-                            config.defender_guard_radius
-                        };
-                        let beyond_home_leash = unit.kind == UnitKind::Defender
-                            && ((nx - unit.order_x).powi(2) + (ny - unit.order_y).powi(2))
-                                > defender_leash.powi(2);
-                        let beyond_sortie_margin = unit.kind == UnitKind::Defender
-                            && defender_can_sortie
-                            && candidate_owner != Some(unit.owner_id)
-                            && defender_sortie_anchor.is_some_and(|(allied_x, allied_y, _)| {
-                                ((nx - allied_x).powi(2) + (ny - allied_y).powi(2))
-                                    > config.defender_sortie_margin.powi(2)
-                            });
                         let blocked = map_width > 0
                             && map_height > 0
                             && (obstacles.contains(&(tile_y * map_width + tile_x))
                                 || wall_obstacles.contains(&(tile_y * map_width + tile_x))
-                                || beyond_home_leash
-                                || beyond_sortie_margin
                                 || (unit.kind == UnitKind::Defender
                                     && defender_started_allied
-                                    && !defender_can_sortie
+                                    && !defender_pursuing
                                     && candidate_owner != Some(unit.owner_id)));
                         if blocked {
                             continue;
@@ -682,10 +667,38 @@ fn main() {
                 continue;
             }
             let Some(target) = units.get(&event.target_id) else {
-                // Human health and respawning are migrated separately. Unit
-                // targets already killed by an earlier hit are discarded.
-                if humans.contains_key(&event.target_id) {
-                    authoritative_events.push(event);
+                if let Some(snapshot) = humans.get(&event.target_id).cloned() {
+                    if !snapshot.alive || request.now < snapshot.invulnerable_until {
+                        continue;
+                    }
+                    let respawn = tile_targets.nearest_allied(
+                        snapshot.x,
+                        snapshot.y,
+                        snapshot.id,
+                        &tile_owners,
+                    );
+                    let mut killed = false;
+                    if let Some(human) = humans.get_mut(&event.target_id) {
+                        human.hp -= event.amount;
+                        if human.hp <= 0.0 {
+                            killed = true;
+                            if let Some((x, y)) = respawn {
+                                human.x = x;
+                                human.y = y;
+                                human.hp = human.max_hp;
+                                human.invulnerable_until =
+                                    request.now + config.respawn_invulnerability_ms;
+                            } else {
+                                human.hp = 0.0;
+                                human.alive = false;
+                            }
+                        }
+                    }
+                    if killed {
+                        if let Some(attacker) = humans.get_mut(&event.owner_id) {
+                            attacker.kills = attacker.kills.saturating_add(1);
+                        }
+                    }
                 }
                 continue;
             };
@@ -717,10 +730,217 @@ fn main() {
             }
             authoritative_events.push(event);
         }
+        let supply_due = request.now.saturating_sub(last_supply_update)
+            >= config.supply_update_interval_ms
+            && map_width > 0
+            && map_height > 0;
+        if supply_due {
+            last_supply_update = request.now;
+            let mut supplied = vec![false; tile_owners.len()];
+            let mut sources = humans
+                .values()
+                .filter(|human| human.alive)
+                .map(|human| {
+                    (
+                        human.id,
+                        human.capital_x + 0.5,
+                        human.capital_y + 0.5,
+                        config.supply_capital_radius,
+                    )
+                })
+                .collect::<Vec<_>>();
+            sources.extend(units.units().filter_map(|unit| {
+                (unit.kind == UnitKind::Bastion && unit.bastion_type == 3).then_some((
+                    unit.owner_id,
+                    unit.x,
+                    unit.y,
+                    config.supply_relay_radius,
+                ))
+            }));
+            for (owner_id, source_x, source_y, radius) in sources {
+                let min_x = (source_x - radius).floor().max(0.0) as u32;
+                let max_x = (source_x + radius)
+                    .floor()
+                    .min(map_width.saturating_sub(1) as f32) as u32;
+                let min_y = (source_y - radius).floor().max(0.0) as u32;
+                let max_y = (source_y + radius)
+                    .floor()
+                    .min(map_height.saturating_sub(1) as f32) as u32;
+                let radius_sq = radius * radius;
+                for y in min_y..=max_y {
+                    for x in min_x..=max_x {
+                        let index = (y * map_width + x) as usize;
+                        let dx = x as f32 + 0.5 - source_x;
+                        let dy = y as f32 + 0.5 - source_y;
+                        if dx * dx + dy * dy <= radius_sq
+                            && tile_owners.get(index).copied() == Some(owner_id)
+                        {
+                            supplied[index] = true;
+                        }
+                    }
+                }
+            }
+            let mut supplied_counts = HashMap::<u32, u32>::new();
+            let mut unsupplied_counts = HashMap::<u32, u32>::new();
+            for index in 0..tile_owners.len() {
+                let owner_id = tile_owners[index];
+                if owner_id == 0 || obstacles.contains(&(index as u32)) {
+                    tile_unsupplied_since[index] = 0;
+                    tile_supply_stage[index] = 0;
+                    continue;
+                }
+                if supplied[index] {
+                    *supplied_counts.entry(owner_id).or_default() += 1;
+                    tile_unsupplied_since[index] = 0;
+                    if tile_supply_stage[index] != 0 {
+                        tile_supply_stage[index] = 0;
+                        authoritative_events.push(SimulationEvent {
+                            kind: 4,
+                            entity_id: 0,
+                            target_id: 0,
+                            tile_index: index as u32,
+                            amount: 0.0,
+                            owner_id,
+                        });
+                    }
+                    continue;
+                }
+                *unsupplied_counts.entry(owner_id).or_default() += 1;
+                if tile_unsupplied_since[index] == 0 {
+                    tile_unsupplied_since[index] = request.now;
+                }
+                let elapsed = request.now.saturating_sub(tile_unsupplied_since[index]);
+                if elapsed >= config.supply_decay_ms {
+                    tile_owners[index] = 0;
+                    tile_unsupplied_since[index] = 0;
+                    tile_supply_stage[index] = 0;
+                    authoritative_events.push(SimulationEvent {
+                        kind: 0,
+                        entity_id: 0,
+                        target_id: 0,
+                        tile_index: index as u32,
+                        amount: 0.0,
+                        owner_id: 0,
+                    });
+                    continue;
+                }
+                let stage = (1 + elapsed.saturating_mul(u64::from(config.supply_decay_stages))
+                    / config.supply_decay_ms.max(1))
+                .min(u64::from(config.supply_decay_stages)) as u8;
+                if stage != tile_supply_stage[index] {
+                    tile_supply_stage[index] = stage;
+                    authoritative_events.push(SimulationEvent {
+                        kind: 4,
+                        entity_id: 0,
+                        target_id: 0,
+                        tile_index: index as u32,
+                        amount: f32::from(stage),
+                        owner_id,
+                    });
+                }
+            }
+            if request.now.saturating_sub(last_income_update) >= config.income_interval_ms {
+                last_income_update = request.now;
+                for human in humans.values_mut().filter(|human| human.alive) {
+                    let supplied_count =
+                        supplied_counts.get(&human.id).copied().unwrap_or_default();
+                    let unsupplied_count = unsupplied_counts
+                        .get(&human.id)
+                        .copied()
+                        .unwrap_or_default();
+                    human.money += ((supplied_count as f32
+                        + unsupplied_count as f32 * config.unsupplied_income_multiplier)
+                        * config.income_per_tile)
+                        .floor();
+                }
+            }
+        }
         units.reconcile_transfers();
         response.schedules.truncate(processed_schedules);
         response.events = authoritative_events;
+        response.humans = humans.values().cloned().collect();
+        for (cell_x, cell_y, full) in request.network_cells.iter().copied() {
+            let center_x = (f32::from(cell_x) + 0.5) * 16.0;
+            let center_y = (f32::from(cell_y) + 0.5) * 16.0;
+            let snapshot = units.network_snapshot(center_x, center_y, 48.0);
+            let current = snapshot
+                .iter()
+                .cloned()
+                .map(|unit| (unit.id, unit))
+                .collect::<HashMap<_, _>>();
+            let previous = network_previous.entry((cell_x, cell_y)).or_default();
+            let created: Vec<_> = snapshot
+                .iter()
+                .filter(|unit| !previous.contains_key(&unit.id))
+                .cloned()
+                .collect();
+            let updated: Vec<_> = snapshot
+                .iter()
+                .filter(|unit| previous.get(&unit.id).is_some_and(|old| old != *unit))
+                .cloned()
+                .collect();
+            let removed: Vec<_> = previous
+                .keys()
+                .filter(|id| !current.contains_key(id))
+                .copied()
+                .collect();
+            let kind_code = |kind| match kind {
+                UnitKind::Robot => 0u8,
+                UnitKind::Soldier => 1,
+                UnitKind::Bastion => 2,
+                UnitKind::Headquarters => 3,
+                UnitKind::Attacker => 4,
+                UnitKind::Defender => 5,
+            };
+            let compact = |unit: &tile_dominion_simulation::UnitState| {
+                (
+                    unit.id,
+                    unit.owner_id,
+                    kind_code(unit.kind),
+                    (unit.x * 128.0).round().clamp(0.0, 65535.0) as u16,
+                    (unit.y * 128.0).round().clamp(0.0, 65535.0) as u16,
+                    unit.hp,
+                    unit.next_produce,
+                    unit.bastion_type,
+                    (unit.order_x * 128.0).round().clamp(0.0, 65535.0) as u16,
+                    (unit.order_y * 128.0).round().clamp(0.0, 65535.0) as u16,
+                )
+            };
+            let frame_created = if full {
+                snapshot.iter().map(compact).collect::<Vec<_>>()
+            } else {
+                created.iter().map(compact).collect::<Vec<_>>()
+            };
+            let frame_updated = if full {
+                Vec::new()
+            } else {
+                updated
+                    .iter()
+                    .map(|unit| {
+                        (
+                            unit.id,
+                            (unit.x * 128.0).round().clamp(0.0, 65535.0) as u16,
+                            (unit.y * 128.0).round().clamp(0.0, 65535.0) as u16,
+                            unit.hp,
+                            unit.next_produce,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let frame_removed = if full { Vec::new() } else { removed };
+            let frame = rmp_serde::to_vec(&(frame_created, frame_updated, frame_removed, full))
+                .unwrap_or_default();
+            response.network_zones.push(NetworkZoneDelta {
+                cell_x,
+                cell_y,
+                frame,
+            });
+            *previous = current;
+        }
         let movement_us = movement_started.elapsed().as_micros() as u64;
+        if !request.return_schedules {
+            response.schedules.clear();
+        }
         response.metrics = Some(EngineMetrics {
             decode_us,
             sync_us,

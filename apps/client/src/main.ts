@@ -15,6 +15,18 @@ let room: Room | null = null,
   seq = 0,
   sceneRef: Dominion | null = null;
 const clientUnits = new Map<number, UnitView>();
+const rustIds = new Map<number, string>();
+let pendingRustUnitDelta = { created: [] as number[], updated: [] as number[], removed: [] as number[] };
+type RustUnitFrame = [
+  Array<[number, number, number, number, number, number, number, number, number, number]>,
+  Array<[number, number, number, number, number]>,
+  number[],
+  boolean,
+];
+const maxHpFor = (kind: UnitView["kind"], bastionType?: UnitView["bastionType"]) =>
+  kind === "bastion" && bastionType === "wall" ? GAME.units.bastion.wallHp
+    : kind === "bastion" && bastionType === "turret" ? GAME.units.bastion.turretHp
+      : GAME.units[kind].hp;
 const $ = (s: string) => document.querySelector(s) as HTMLElement;
 class Dominion extends Phaser.Scene {
   tileChunks = new Map<
@@ -599,7 +611,8 @@ class Dominion extends Phaser.Scene {
         )
         .setStrokeStyle(8, 0x39e6d0)
         .setDepth(-2);
-    const owners = new Map(s.players.map((p) => [p.id, p.color]));
+    const owners = new Map(s.leaderboard.map((p) => [p.id, p.color]));
+    for (const player of s.players) owners.set(player.id, player.color);
     this.renderTiles(s.tiles, owners);
     const alivePlayers = new Set<string>();
     for (const p of s.players) {
@@ -851,11 +864,52 @@ $("#play").onclick = async () => {
       import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567",
     ).joinOrCreate("dominion", { name });
     myId = room.sessionId;
+    room.onMessage("unitIds", (payload: Uint8Array | Array<[number, string]>) => {
+      const mappings = payload instanceof Uint8Array
+        ? decode(payload) as Array<[number, string]>
+        : payload;
+      for (const [id, value] of mappings) rustIds.set(id, value);
+    });
+    room.onMessage("units", (payload: Uint8Array) => {
+      const [created, updated, removed, full] = decode(payload) as RustUnitFrame;
+      const removedIds = full ? [...clientUnits.keys()] : [...removed];
+      if (full) clientUnits.clear();
+      for (const u of created) {
+        const kind: UnitView["kind"] = u[2] === 0 ? "robot" : u[2] === 1 ? "soldier"
+          : u[2] === 2 ? "bastion" : u[2] === 3 ? "headquarters"
+            : u[2] === 4 ? "attacker" : "defender";
+        const bastionType: UnitView["bastionType"] = u[7] === 1 ? "fortress"
+          : u[7] === 2 ? "factory" : u[7] === 3 ? "relay"
+            : u[7] === 4 ? "wall" : u[7] === 5 ? "turret" : undefined;
+        clientUnits.set(u[0], {
+          id: u[0], serverId: rustIds.get(u[0]) ?? String(u[0]),
+          ownerId: rustIds.get(u[1]) ?? "neutral", kind,
+          x: u[3] / 128, y: u[4] / 128, hp: u[5], maxHp: maxHpFor(kind, bastionType),
+          nextProduce: u[6], bastionType,
+          homeX: kind === "defender" ? u[8] / 128 : undefined,
+          homeY: kind === "defender" ? u[9] / 128 : undefined,
+        });
+      }
+      for (const u of updated) {
+        const current = clientUnits.get(u[0]);
+        if (!current) continue;
+        current.x = u[1] / 128; current.y = u[2] / 128;
+        current.hp = u[3]; current.nextProduce = u[4];
+      }
+      for (const id of removed) clientUnits.delete(id);
+      pendingRustUnitDelta = {
+        created: created.map((u) => u[0]),
+        updated: updated.map((u) => u[0]),
+        removed: removedIds,
+      };
+    });
     room.onMessage("state", (payload: CompactSnapshot | Uint8Array) => {
       const wire = payload instanceof Uint8Array
         ? (decode(payload) as CompactSnapshot)
         : payload;
       const s = expandSnapshot(wire, clientUnits);
+      s.unitDelta = pendingRustUnitDelta;
+      pendingRustUnitDelta = { created: [], updated: [], removed: [] };
       for (const [x, y, , ob] of s.tiles) {
         const k = `${x},${y}`;
         if (ob) sceneRef?.obstacles.add(k);

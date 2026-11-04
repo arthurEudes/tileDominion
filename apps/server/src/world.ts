@@ -44,6 +44,7 @@ export class World {
   readonly suppliedTerritoryCounts = new Map<string, number>();
   readonly unsuppliedTerritoryCounts = new Map<string, number>();
   readonly spatial = new SpatialIndex(16);
+  readonly rustNetworkZones = new Map<string, Uint8Array>();
   readonly suppliedTiles = new Uint8Array(GAME.map.width * GAME.map.height);
   readonly wallTiles = new Set<string>();
   readonly capitals = new Map<string, { x: number; y: number }>();
@@ -409,7 +410,12 @@ export class World {
     // tick, so the published index must represent the resulting positions.
     this.spatial.rebuild(this.players.values(), this.units.values());
   }
-  async tickWithRust(engine: RustEngine, dt: number, now = Date.now()) {
+  async tickWithRust(
+    engine: RustEngine,
+    dt: number,
+    now = Date.now(),
+    mirrorUnitSchedules = true,
+  ) {
     const rustTileChanges = [...this.rustDirtyTiles];
     const unitChanges = [...this.rustDirtyUnits],
       unitRemovals = [...this.rustRemovedUnits],
@@ -424,13 +430,13 @@ export class World {
         return unit ? [unit] : [];
       }),
       unitRemovals.map(([id]) => id),
-      playerChanges.flatMap(([id]) => {
-        const player = this.players.get(id);
-        return player ? [player] : [];
-      }),
+      this.players.values(),
       playerRemovals.map(([id]) => id),
       this.map,
       rustTileChanges,
+      dt,
+      this.capitals,
+      mirrorUnitSchedules,
         )
       : {
           schedules: await engine.scheduleDelta(
@@ -449,17 +455,34 @@ export class World {
             rustTileChanges,
           ),
           events: [],
+          players: [],
+          networkZones: [],
         };
     const { schedules, events } = tickResult;
+    this.rustNetworkZones.clear();
+    for (const zone of tickResult.networkZones ?? []) {
+      this.rustNetworkZones.set(zone.cell, zone.frame);
+    }
     for (const tileKey of rustTileChanges) this.rustDirtyTiles.delete(tileKey);
     this.ackVersions(this.rustDirtyUnits, unitChanges);
     this.ackVersions(this.rustRemovedUnits, unitRemovals);
     this.ackVersions(this.rustDirtyPlayers, playerChanges);
     this.ackVersions(this.rustRemovedPlayers, playerRemovals);
-    // Keep the operation transactional until the subprocess has answered so
-    // the caller can run exactly one fallback tick after a Rust failure.
-    for (const p of this.players.values()) this.tickPlayer(p, dt, now);
-    for (const p of this.players.values()) this.markPlayer(p.id);
+    // Rust is authoritative for player movement and capture. Node mirrors the
+    // compact player states solely for networking and command validation.
+    for (const state of tickResult.players ?? []) {
+      const player = this.players.get(state.id);
+      if (!player) continue;
+      player.x = state.x;
+      player.y = state.y;
+      player.alive = state.alive;
+      player.hp = state.hp;
+      player.money = state.money;
+      player.kills = state.kills;
+      player.invulnerableUntil = state.invulnerableUntil;
+      player.captureKey = state.captureKey;
+      player.captureSince = state.captureSince;
+    }
     for (const schedule of schedules) {
       const u = this.units.get(schedule.id);
       if (!u) continue;
@@ -480,9 +503,8 @@ export class World {
       this.enforceUnitBounds(u);
     }
     for (const event of events) this.applyRustEvent(event);
-    this.spatial.rebuild(this.players.values(), this.units.values());
-    this.updateSupply(now);
-    this.applyIncome(dt);
+    if (mirrorUnitSchedules || schedules.length)
+      this.spatial.rebuild(this.players.values(), this.units.values());
   }
   private applyRustStructureEffects(u: Unit, now: number) {
     if (u.ownerId === NEUTRAL_OWNER_ID) return;
@@ -535,13 +557,24 @@ export class World {
   }
   private applyRustEvent(event: RustSimulationEvent) {
     if (event.kind === 0) {
-      if (!event.ownerId) return;
       const x = event.tileIndex % GAME.map.width,
         y = Math.floor(event.tileIndex / GAME.map.width),
         tileKey = key(x, y),
         tile = this.map.get(tileKey);
       if (tile && !tile.obstacle && tile.owner !== event.ownerId)
-        this.setOwner(tileKey, tile, event.ownerId);
+        this.setOwner(tileKey, tile, event.ownerId ?? null);
+      return;
+    }
+    if (event.kind === 4) {
+      const tile = this.tileList[event.tileIndex];
+      if (!tile) return;
+      tile.supplyDecay = Math.max(0, Math.floor(event.amount));
+      tile.unsuppliedSince = tile.supplyDecay ? Date.now() : 0;
+      this.suppliedTiles[event.tileIndex] = tile.supplyDecay ? 0 : 1;
+      this.dirtyTiles.add(key(
+        event.tileIndex % GAME.map.width,
+        Math.floor(event.tileIndex / GAME.map.width),
+      ));
       return;
     }
     if (event.kind === 2) {
@@ -765,25 +798,13 @@ export class World {
           ? now + GAME.simulation.targetCacheMs
           : now + GAME.simulation.intermediateIntervalMs;
       }
-      if (u.kind === "defender") {
-        const homeX = u.homeX ?? u.orderX,
-          homeY = u.homeY ?? u.orderY,
-          homeDistance = Math.hypot(u.x - homeX, u.y - homeY),
-          alliedDistance = defenderReturnTarget?.distance ?? 0,
-          canSortie = !!target &&
-            homeDistance <=
-              GAME.units.defender.guardRadius + GAME.units.defender.sortieMargin &&
-            (defenderStartedAllied ||
-              alliedDistance <= GAME.units.defender.sortieMargin),
-          mustReturn = !canSortie &&
-            (!defenderStartedAllied ||
-              homeDistance > GAME.units.defender.guardRadius);
-        defenderPursuing = canSortie;
-        if (mustReturn) {
-          target = undefined;
-          u.cachedTargetId = "";
-          u.cachedTargetUntil = now + GAME.simulation.intermediateIntervalMs;
-          const destination = defenderReturnTarget ?? { x: homeX, y: homeY };
+      defenderPursuing = u.kind === "defender" && !!target;
+      if (u.kind === "defender" && !defenderStartedAllied && !defenderPursuing) {
+        target = undefined;
+        u.cachedTargetId = "";
+        u.cachedTargetUntil = now + GAME.simulation.intermediateIntervalMs;
+        if (defenderReturnTarget) {
+          const destination = defenderReturnTarget;
           const distance = Math.hypot(destination.x - u.x, destination.y - u.y) || 1;
           u.dirX = (destination.x - u.x) / distance;
           u.dirY = (destination.y - u.y) / distance;
@@ -841,17 +862,6 @@ export class World {
         }
       }
     }
-    if (u.kind === "defender" && !defenderPursuing && !directed) {
-      const homeX = u.homeX ?? u.orderX,
-        homeY = u.homeY ?? u.orderY,
-        homeDistance = Math.hypot(u.x - homeX, u.y - homeY);
-      if (homeDistance >= GAME.units.defender.guardRadius * 0.85) {
-        u.dirX = (homeX - u.x) / (homeDistance || 1);
-        u.dirY = (homeY - u.y) / (homeDistance || 1);
-        u.nextThink = now + 200;
-        directed = true;
-      }
-    }
     if (!directed && now >= u.nextThink) {
       u.nextThink = now + 700 + Math.random() * 900;
       const a = Math.random() * Math.PI * 2;
@@ -866,13 +876,6 @@ export class World {
       u.kind === "defender"
         ? {
             stayOnAlliedTerritory: defenderStartedAllied && !defenderPursuing,
-            maxHomeDistance:
-              GAME.units.defender.guardRadius +
-              (defenderPursuing ? GAME.units.defender.sortieMargin : 0),
-            alliedAnchor: defenderPursuing ? defenderReturnTarget : undefined,
-            maxAlliedDistance: defenderPursuing
-              ? GAME.units.defender.sortieMargin
-              : undefined,
           }
         : undefined,
     );
@@ -883,9 +886,6 @@ export class World {
     dt: number,
     constraints?: {
       stayOnAlliedTerritory?: boolean;
-      maxHomeDistance?: number;
-      alliedAnchor?: { x: number; y: number };
-      maxAlliedDistance?: number;
     },
   ) {
     if (!dt || (!u.dirX && !u.dirY)) return;
@@ -905,21 +905,9 @@ export class World {
         nx = clamp(u.x + dx * speed * dt, 0.1, GAME.map.width - 0.1),
         ny = clamp(u.y + dy * speed * dt, 0.1, GAME.map.height - 0.1),
         candidateAllied =
-          this.map.get(key(Math.floor(nx), Math.floor(ny)))?.owner === u.ownerId,
-        beyondHome = constraints?.maxHomeDistance !== undefined &&
-          Math.hypot(nx - (u.homeX ?? u.orderX), ny - (u.homeY ?? u.orderY)) >
-            constraints.maxHomeDistance,
-        beyondAlliedMargin = !candidateAllied &&
-          constraints?.alliedAnchor !== undefined &&
-          constraints.maxAlliedDistance !== undefined &&
-          Math.hypot(
-            nx - constraints.alliedAnchor.x,
-            ny - constraints.alliedAnchor.y,
-          ) > constraints.maxAlliedDistance;
+          this.map.get(key(Math.floor(nx), Math.floor(ny)))?.owner === u.ownerId;
       if (
         this.isMovementBlocked(nx, ny) ||
-        beyondHome ||
-        beyondAlliedMargin ||
         (constraints?.stayOnAlliedTerritory && !candidateAllied)
       ) continue;
       u.x = nx;
