@@ -1,7 +1,11 @@
 services:
   server:
     build: .
-    environment: [PORT=2567, CLIENT_URL=http://localhost:5173, STORAGE_DRIVER=memory]
+    environment:
+      PORT: 2567
+      CLIENT_URL: http://localhost:5173
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-memory}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tile:tile@postgres:5432/tile_dominion}
     ports: ["2567:2567"]
   client:
     build: .

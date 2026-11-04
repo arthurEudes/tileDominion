@@ -14,6 +14,16 @@ let room: Room | null = null,
   snap: ClientSnapshot | null = null,
   seq = 0,
   sceneRef: Dominion | null = null;
+const serverUrl = import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567";
+type Account = { id: string; username: string; score: number };
+let authToken = localStorage.getItem("tileDominionToken") ?? "";
+let account: Account | null = (() => {
+  try {
+    return JSON.parse(localStorage.getItem("tileDominionAccount") ?? "null");
+  } catch {
+    return null;
+  }
+})();
 const clientUnits = new Map<number, UnitView>();
 const rustIds = new Map<number, string>();
 let pendingRustUnitDelta = { created: [] as number[], updated: [] as number[], removed: [] as number[] };
@@ -28,6 +38,60 @@ const maxHpFor = (kind: UnitView["kind"], bastionType?: UnitView["bastionType"])
     : kind === "bastion" && bastionType === "turret" ? GAME.units.bastion.turretHp
       : GAME.units[kind].hp;
 const $ = (s: string) => document.querySelector(s) as HTMLElement;
+function setAccount(next: Account | null, token = "") {
+  account = next;
+  authToken = token;
+  if (next) {
+    localStorage.setItem("tileDominionToken", token);
+    localStorage.setItem("tileDominionAccount", JSON.stringify(next));
+    $("#accountStatus").textContent = `${next.username} · ${next.score} points`;
+    $("#play").textContent = `JOUER AVEC ${next.username.toUpperCase()}`;
+    (document.querySelector("#name") as HTMLInputElement).value = next.username;
+  } else {
+    localStorage.removeItem("tileDominionToken");
+    localStorage.removeItem("tileDominionAccount");
+    $("#accountStatus").textContent = "Mode invité — le score ne sera pas enregistré.";
+    $("#play").textContent = "JOUER EN INVITÉ";
+  }
+}
+
+async function authenticate(path: "login" | "register") {
+  const username = (document.querySelector("#name") as HTMLInputElement).value.trim();
+  const password = (document.querySelector("#password") as HTMLInputElement).value;
+  const status = $("#accountStatus");
+  status.textContent = path === "register" ? "Création du compte…" : "Connexion…";
+  try {
+    const response = await fetch(`${serverUrl}/auth/${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await response.json() as { token?: string; account?: Account; error?: string };
+    if (!response.ok || !body.token || !body.account)
+      throw new Error(body.error ?? "Authentification impossible");
+    setAccount(body.account, body.token);
+    (document.querySelector("#password") as HTMLInputElement).value = "";
+    await loadGlobalLeaderboard();
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : "Authentification impossible";
+  }
+}
+
+async function loadGlobalLeaderboard() {
+  const target = $("#globalLeaderboard").querySelector("span")!;
+  try {
+    const response = await fetch(`${serverUrl}/leaderboard`);
+    if (!response.ok) throw new Error();
+    const { players } = await response.json() as { players: Account[] };
+    target.innerHTML = players.length
+      ? players.slice(0, 10).map((player, index) =>
+          `${index + 1}. ${escapeHtml(player.username)} — ${player.score} pts`,
+        ).join("<br>")
+      : "Aucun score pour le moment.";
+  } catch {
+    target.textContent = "Classement indisponible.";
+  }
+}
 class Dominion extends Phaser.Scene {
   tileChunks = new Map<
     string,
@@ -83,6 +147,27 @@ class Dominion extends Phaser.Scene {
   inputElapsed = 0;
   localInput = { x: 0, y: 0 };
   impactBudget = 0;
+  resetMatch() {
+    for (const { texture, image } of this.tileChunks.values()) {
+      image.destroy();
+      texture.destroy();
+    }
+    for (const actor of this.actors.values()) actor.destroy();
+    for (const bob of this.unitBobs.values()) bob.destroy();
+    for (const bob of this.unitOutlineBobs.values()) bob.destroy();
+    this.tileChunks.clear();
+    this.tileColors.clear();
+    this.obstacles.clear();
+    this.actors.clear();
+    this.unitBobs.clear();
+    this.unitOutlineBobs.clear();
+    this.unitRender.clear();
+    this.targets.clear();
+    this.previousHp.clear();
+    this.selected.clear();
+    this.unitServerIds.clear();
+    this.pendingAction = null;
+  }
   create() {
     sceneRef = this;
     this.cameras.main.setBackgroundColor(0x0a1827);
@@ -743,6 +828,14 @@ class StrategicMinimap {
     this.context = context;
     this.marker = root.querySelector("i") as HTMLElement;
   }
+  resetMatch() {
+    this.owners = [];
+    this.colors.clear();
+    this.width = 0;
+    this.height = 0;
+    this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.marker.hidden = true;
+  }
   apply([full, width, height, changes]: MinimapMessage) {
     if (full || width !== this.width || height !== this.height) {
       this.width = width;
@@ -854,15 +947,21 @@ document.querySelectorAll("[data-order]").forEach((button) =>
     }
   }),
 );
+$("#login").onclick = () => void authenticate("login");
+$("#register").onclick = () => void authenticate("register");
+if (account && authToken) setAccount(account, authToken);
+void loadGlobalLeaderboard();
+
 $("#play").onclick = async () => {
   const name =
     (document.querySelector("#name") as HTMLInputElement).value.trim() ||
     `Invité_${Math.floor(Math.random() * 9999)}`;
   $("#play").textContent = "CONNEXION…";
   try {
-    room = await new Client(
-      import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567",
-    ).joinOrCreate("dominion", { name });
+    room = await new Client(serverUrl).joinOrCreate("dominion", {
+      name,
+      ...(authToken ? { token: authToken } : {}),
+    });
     myId = room.sessionId;
     room.onMessage("unitIds", (payload: Uint8Array | Array<[number, string]>) => {
       const mappings = payload instanceof Uint8Array
@@ -943,6 +1042,22 @@ $("#play").onclick = async () => {
     room.onMessage("orderResult", (r: { ok: boolean; message: string }) =>
       showNotice(r.message, r.ok),
     );
+    room.onMessage("account", (updated: Account) => setAccount(updated, authToken));
+    room.onMessage("matchResult", (result: { points: number; score: number }) => {
+      if (account) setAccount({ ...account, score: result.score }, authToken);
+      showNotice(`Partie terminée : +${result.points} points`, true);
+      void loadGlobalLeaderboard();
+    });
+    room.onMessage("newMatch", () => {
+      clientUnits.clear();
+      rustIds.clear();
+      pendingRustUnitDelta = { created: [], updated: [], removed: [] };
+      snap = null;
+      sceneRef?.resetMatch();
+      minimap.resetMatch();
+      room?.send("ready");
+      showNotice("Nouvelle partie lancée", true);
+    });
     room.send("ready");
     room.onLeave(() => {
       $("#connection").style.color = "#ff5263";
@@ -951,7 +1066,7 @@ $("#play").onclick = async () => {
     $("#hud").hidden = false;
   } catch (e) {
     console.error(e);
-    $("#play").textContent = "SERVEUR INJOIGNABLE — RÉESSAYER";
+    $("#play").textContent = "CONNEXION REFUSÉE — SE RECONNECTER";
   }
 };
 function showNotice(message: string, ok: boolean) {

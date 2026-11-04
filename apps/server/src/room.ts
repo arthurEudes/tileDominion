@@ -1,4 +1,5 @@
 import { Room, Client } from "colyseus";
+import { randomUUID } from "node:crypto";
 import { encode } from "@msgpack/msgpack";
 import { COLORS, GAME } from "@tile/game-config";
 import {
@@ -16,6 +17,7 @@ import {
 import { World } from "./world.js";
 import { RustEngine } from "./rust-engine.js";
 import { key, type Player, type Unit } from "./model.js";
+import { accounts, type PublicAccount } from "./accounts.js";
 
 type BotForces = {
   robots: Unit[];
@@ -61,6 +63,10 @@ export class DominionRoom extends Room {
   fullNetworkCells = new Set<string>();
   globalUnitIds = new Map<string, number>();
   nextGlobalUnitId = 1;
+  matchId = randomUUID();
+  readonly playerAccounts = new Map<string, PublicAccount>();
+  matchFinished = false;
+  matchFinishing = false;
   minimapOwners: Array<string | null> = [];
   onCreate() {
     for (let i = 0; i < GAME.bots.count; i++) this.addBot();
@@ -156,14 +162,29 @@ export class DominionRoom extends Room {
       });
     });
   }
-  onJoin(c: Client, opts: unknown) {
+  onAuth(_client: Client, opts: unknown) {
+    const token = typeof opts === "object" && opts !== null
+      ? (opts as { token?: unknown }).token
+      : undefined;
+    if (token === undefined) return { guest: true };
+    const account = accounts.resolve(token);
+    if (!account) return false;
+    if ([...this.playerAccounts.values()].some(({ id }) => id === account.id)) return false;
+    return { account };
+  }
+  onJoin(c: Client, opts: unknown, auth?: { guest?: true; account?: PublicAccount }) {
     const v = JoinSchema.safeParse(opts);
+    const account = auth?.account;
     this.evictBotForHuman();
     this.world.addPlayer(
       c.sessionId,
-      v.success ? v.data.name : `Invité-${c.sessionId.slice(0, 4)}`,
+      account?.username ?? (v.success ? v.data.name : `Invité-${c.sessionId.slice(0, 4)}`),
       COLORS[this.clients.length % COLORS.length],
     );
+    if (account) {
+      this.playerAccounts.set(c.sessionId, account);
+      c.send("account", account);
+    }
     this.rust.invalidateMap();
     c.send("welcome", { id: c.sessionId });
   }
@@ -198,6 +219,13 @@ export class DominionRoom extends Room {
     if (this.simulationBusy) return;
     this.simulationBusy = true;
     const now = Date.now();
+    if (now >= this.world.endsAt) {
+      try {
+        await this.finishMatch();
+      } catch (error) {
+        console.error("Échec de l’attribution des scores de fin de partie", error);
+      }
+    }
     try {
       this.updateBots(now);
       const networkDue = this.elapsed + dt >= 0.1;
@@ -230,6 +258,70 @@ export class DominionRoom extends Room {
     } finally {
       this.simulationBusy = false;
     }
+  }
+  async finishMatch() {
+    if (this.matchFinished || this.matchFinishing) return;
+    this.matchFinishing = true;
+    try {
+      const capturableTiles = this.world.tileList.reduce(
+        (total, tile) => total + (tile.obstacle ? 0 : 1),
+        0,
+      );
+      const results = await Promise.all(
+        [...this.playerAccounts].map(async ([sessionId, account]) => {
+          const tiles = this.world.territoryCounts.get(sessionId) ?? 0;
+          const points = scoreForTerritory(tiles, capturableTiles);
+          const updated = await accounts.awardScore(account.id, this.matchId, points);
+          return { sessionId, points, score: updated?.score ?? account.score };
+        }),
+      );
+      this.matchFinished = true;
+      for (const result of results)
+        this.clients
+          .find(({ sessionId }) => sessionId === result.sessionId)
+          ?.send("matchResult", { points: result.points, score: result.score });
+      this.startNextMatch();
+    } finally {
+      this.matchFinishing = false;
+    }
+  }
+  startNextMatch() {
+    const humans = this.clients.map((client) => ({
+      sessionId: client.sessionId,
+      name:
+        this.playerAccounts.get(client.sessionId)?.username ??
+        this.world.players.get(client.sessionId)?.name ??
+        `Invité-${client.sessionId.slice(0, 4)}`,
+    }));
+
+    this.rust.close();
+    this.world = new World();
+    this.rust = new RustEngine();
+    this.matchId = randomUUID();
+    this.matchFinished = false;
+    this.elapsed = 0;
+    this.botThink.clear();
+    this.botBuildThink.clear();
+    this.botSerial = 0;
+    this.unitChannels.clear();
+    this.clientInterestCells.clear();
+    this.fullNetworkCells.clear();
+    this.globalUnitIds.clear();
+    this.nextGlobalUnitId = 1;
+    this.minimapOwners = [];
+
+    for (let index = 0; index < GAME.bots.count; index++) this.addBot();
+    for (const [index, human] of humans.entries()) {
+      this.evictBotForHuman();
+      this.world.addPlayer(
+        human.sessionId,
+        human.name,
+        COLORS[(index + 1) % COLORS.length],
+      );
+      this.fullNetworkCells.add(this.interestCellFor(human.sessionId));
+    }
+    this.rust.invalidateMap();
+    this.broadcast("newMatch", { endsAt: this.world.endsAt });
   }
   updateBots(now: number) {
     const due = [...this.world.players.values()].filter(
@@ -931,4 +1023,9 @@ export class DominionRoom extends Room {
       globalUnits: this.world.units.size,
     };
   }
+}
+
+export function scoreForTerritory(ownedTiles: number, capturableTiles: number) {
+  if (capturableTiles <= 0) return 0;
+  return Math.max(0, Math.min(1000, Math.round((ownedTiles / capturableTiles) * 1000)));
 }

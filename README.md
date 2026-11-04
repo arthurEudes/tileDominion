@@ -12,9 +12,10 @@ Le projet est un MVP multijoueur jouable sur une instance serveur unique :
 - simulation persistante des joueurs, unités, combats, captures, production et ravitaillement dans un moteur Rust ;
 - client Phaser avec interpolation, sélection d’unités, contrôles clavier et tactiles ;
 - reconnexion Colyseus, validation des messages et limitation de débit ;
+- comptes par nom d’utilisateur/mot de passe, score persistant et classement global ;
 - protocole MessagePack compact entre Rust, Node et les clients.
 
-L’état d’une partie est actuellement conservé en mémoire. Le dépôt prépare PostgreSQL dans Docker Compose, mais aucun adaptateur de comptes ou de progression persistante n’est encore branché.
+L’état temps réel d’une partie reste en mémoire. Les comptes et scores utilisent la mémoire par défaut pour le développement, ou PostgreSQL avec `STORAGE_DRIVER=postgres`.
 
 ## Prérequis
 
@@ -32,7 +33,7 @@ npm run build:rust
 npm run dev
 ```
 
-Ouvrir ensuite <http://localhost:5173>. Le serveur Colyseus écoute par défaut sur `http://localhost:2567` et expose `GET /health`.
+Ouvrir ensuite <http://localhost:5173>. Le serveur Colyseus écoute par défaut sur `http://localhost:2567` et expose `GET /health`, les routes d’authentification et le classement global.
 
 Le lancement de développement démarre simultanément :
 
@@ -68,8 +69,28 @@ Le nombre de clients créés par `npm run bots` est contrôlé par `BOT_COUNT`. 
 | `VITE_SERVER_URL` | `http://localhost:2567` | Serveur ciblé par le client Vite |
 | `SERVER_URL` | `http://localhost:2567` | Serveur ciblé par le script de bots externes |
 | `BOT_COUNT` | `12` | Nombre de clients créés par `npm run bots` |
-| `STORAGE_DRIVER` | `memory` | Réservé au futur adaptateur de stockage |
-| `DATABASE_URL` | — | Préparé pour PostgreSQL, pas encore consommé par l’application |
+| `STORAGE_DRIVER` | `memory` | Stockage des comptes : `memory` ou `postgres` |
+| `DATABASE_URL` | — | Connexion PostgreSQL requise avec `STORAGE_DRIVER=postgres` |
+
+## Comptes et classement global
+
+Un compte se crée avec un nom d’utilisateur de 3 à 16 caractères et un mot de passe de 8 à 128 caractères. Les mots de passe ne sont jamais stockés en clair : le serveur conserve uniquement un dérivé `scrypt` salé. Le mode invité reste disponible, mais ne participe pas au classement global.
+
+À la fin de chaque partie, chaque joueur authentifié encore représenté dans la salle reçoit :
+
+```text
+points = arrondi(tuiles possédées / tuiles capturables de la carte × 1000)
+```
+
+Une récompense est identifiée par la partie et le compte, ce qui rend une nouvelle tentative d’écriture sans risque de double crédit. Les routes HTTP disponibles sont :
+
+Après l’attribution, la salle lance immédiatement une nouvelle partie de 10 minutes sur une nouvelle carte. Les clients et leurs comptes restent connectés, tandis que le monde, les IA, le moteur Rust et les caches réseau sont recréés.
+
+- `POST /auth/register` avec `{ "username": "...", "password": "..." }` ;
+- `POST /auth/login` avec les mêmes champs ;
+- `GET /leaderboard` pour les 50 meilleurs scores.
+
+Les sessions sont des jetons opaques valables 30 jours et conservés en mémoire par le processus serveur. Un redémarrage oblige donc à se reconnecter, sans perdre le compte ni le score lorsque PostgreSQL est activé.
 
 ## Règles et contrôles
 
@@ -177,15 +198,14 @@ docker compose up --build
 Pour démarrer également PostgreSQL :
 
 ```bash
-docker compose --profile persistent up --build
+STORAGE_DRIVER=postgres docker compose --profile persistent up --build
 ```
 
-Le conteneur PostgreSQL conserve ses données dans le volume `tile_data`, mais l’application continue actuellement d’utiliser la mémoire.
+Le serveur crée automatiquement les tables `accounts` et `match_scores`. PostgreSQL conserve les comptes, les scores cumulés et le registre idempotent des récompenses dans le volume `tile_data`.
 
 ## Limites avant production distribuée
 
-- comptes, authentification et progression persistante ;
-- adaptateur PostgreSQL réellement utilisé par le serveur ;
+- sessions partagées entre plusieurs processus (actuellement locales au processus) ;
 - Redis Presence et coordination de plusieurs processus Colyseus ;
 - matchmaking distribué et reprise d’une salle après panne ;
 - observabilité durable : métriques, traces, alertes et historique de charge ;

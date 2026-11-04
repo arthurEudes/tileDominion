@@ -13,11 +13,16 @@
       <div class="card">
         <div class="logo">TILE<br /><span>DOMINION</span></div>
         <p>Conquiers la grille. Construis ton armée. Garde ton royaume.</p>
-        <input id="name" maxlength="16" placeholder="Ton pseudonyme" /><button
-          id="play"
-        >
-          JOUER EN INVITÉ</button
-        ><small>WASD / ZQSD / flèches · Espace pour attaquer</small>
+        <input id="name" maxlength="16" autocomplete="username" placeholder="Nom d’utilisateur" />
+        <input id="password" type="password" maxlength="128" autocomplete="current-password" placeholder="Mot de passe (8 caractères minimum)" />
+        <div class="auth-actions">
+          <button id="login">SE CONNECTER</button>
+          <button id="register">CRÉER UN COMPTE</button>
+        </div>
+        <div id="accountStatus">Mode invité — le score ne sera pas enregistré.</div>
+        <button id="play">JOUER EN INVITÉ</button>
+        <div id="globalLeaderboard"><b>CLASSEMENT GLOBAL</b><span>Chargement…</span></div>
+        <small>WASD / ZQSD / flèches · Espace pour attaquer</small>
       </div>
     </div>
     <div id="hud" hidden>

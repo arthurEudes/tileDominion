@@ -36,6 +36,7 @@ export const JoinSchema = z.object({
     .max(16)
     .regex(/^[\p{L}\p{N}_ -]+$/u)
     .default("Invité"),
+  token: z.string().max(128).optional(),
 });
 export type Input = z.infer<typeof InputSchema>;
 export type BuyItem = z.infer<typeof BuySchema>["item"];
