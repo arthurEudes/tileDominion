@@ -442,7 +442,7 @@ export class DominionRoom extends Room {
     for (const unit of this.world.units.values())
       if (unit.ownerId === id) {
         units++;
-        if (unit.kind === "headquarters" || unit.kind === "bastion")
+        if (unit.kind === "bastion")
           structures++;
       }
     return (this.world.territoryCounts.get(id) ?? 0) * 2 + units + structures * 8;
@@ -580,7 +580,7 @@ export class DominionRoom extends Room {
         [...this.world.units.values()]
           .filter(
             (unit) =>
-              unit.kind === "bastion" || unit.kind === "headquarters",
+              unit.kind === "bastion",
           )
           .map((unit) => key(Math.floor(unit.x), Math.floor(unit.y))),
       ),
@@ -884,11 +884,9 @@ export class DominionRoom extends Room {
               ? 1
               : unit.kind === "bastion"
                 ? 2
-                : unit.kind === "headquarters"
-                  ? 3
-                  : unit.kind === "attacker"
-                    ? 4
-                    : 5,
+                : unit.kind === "attacker"
+                  ? 4
+                  : 5,
           x,
           y,
           unit.hp,

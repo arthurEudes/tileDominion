@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { NEUTRAL_OWNER_ID, World } from "./world.js";
 import { key } from "./model.js";
-import { GAME } from "@tile/game-config";
+import { GAME, incomeForTerritory } from "@tile/game-config";
 import { RustEngine } from "./rust-engine.js";
 function world() {
   const w = new World();
@@ -153,10 +153,21 @@ describe("authoritative rules", () => {
       p = w.addPlayer("a", "A", 1),
       before = p.money;
     w.tick(GAME.economy.incomeIntervalMs / 1000);
-    expect(p.money).toBe(
-      before +
-        Math.floor(w.counts("a").tiles * GAME.economy.incomePerTile),
-    );
+    expect(p.money).toBe(before + incomeForTerritory(w.counts("a").tiles));
+  });
+  it("pays base income without any territory", () => {
+    const w = world(),
+      p = w.addPlayer("a", "A", 1);
+    for (const [tileKey, tile] of w.map)
+      if (tile.owner === p.id) w.setOwner(tileKey, tile, null);
+    const before = p.money;
+    w.tick(GAME.economy.incomeIntervalMs / 1000);
+    expect(p.money).toBe(before + GAME.economy.baseIncome);
+  });
+  it("applies diminishing territory returns", () => {
+    expect(incomeForTerritory(100)).toBe(17);
+    expect(incomeForTerritory(300)).toBe(31);
+    expect(incomeForTerritory(1000)).toBe(52);
   });
   it("limits AI capture searches to its configured local radius", () => {
     const w = world(),
@@ -551,13 +562,10 @@ describe("authoritative rules", () => {
     expect(farTile.supplyDecay).toBe(1);
     expect(w.unsuppliedTerritoryCounts.get(p.id)).toBeGreaterThan(0);
     const incomeWithIsolation = p.money;
-    expect(incomeWithIsolation).toBe(
-      Math.floor(
-        ((w.suppliedTerritoryCounts.get(p.id) ?? 0) +
-          (w.unsuppliedTerritoryCounts.get(p.id) ?? 0) * 0.5) *
-          GAME.economy.incomePerTile,
-      ),
-    );
+    expect(incomeWithIsolation).toBe(incomeForTerritory(
+      (w.suppliedTerritoryCounts.get(p.id) ?? 0) +
+        (w.unsuppliedTerritoryCounts.get(p.id) ?? 0) * 0.5,
+    ));
 
     w.tick(0, now + GAME.supply.decayMs + GAME.supply.updateIntervalMs);
     expect(farTile.owner).toBeNull();
@@ -582,26 +590,26 @@ describe("authoritative rules", () => {
     expect(w.suppliedTiles[y * GAME.map.width + x]).toBe(1);
     expect(enclave.supplyDecay).toBe(0);
   });
-  it("anchors supply to an abstract capital instead of the character", () => {
+  it("anchors supply independently from the character", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1),
-      capital = w.capitals.get(p.id)!;
-    p.x = Math.min(GAME.map.width - 1, capital.x + 80);
-    p.y = Math.min(GAME.map.height - 1, capital.y + 80);
+      anchor = w.supplyAnchors.get(p.id)!;
+    p.x = Math.min(GAME.map.width - 1, anchor.x + 80);
+    p.y = Math.min(GAME.map.height - 1, anchor.y + 80);
 
     w.tick(0, Date.now() + GAME.supply.updateIntervalMs + 1);
-    expect(w.isTileSupplied(capital.x, capital.y)).toBe(true);
-    expect(w.map.get(key(capital.x, capital.y))?.owner).toBe(p.id);
+    expect(w.isTileSupplied(anchor.x, anchor.y)).toBe(true);
+    expect(w.map.get(key(anchor.x, anchor.y))?.owner).toBe(p.id);
   });
-  it("relocates a captured abstract capital onto allied territory", () => {
+  it("relocates a captured supply anchor onto allied territory", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1),
       enemy = w.addPlayer("b", "B", 2),
-      previous = w.capitals.get(p.id)!,
+      previous = w.supplyAnchors.get(p.id)!,
       tile = w.map.get(key(previous.x, previous.y))!;
 
     w.setOwner(key(previous.x, previous.y), tile, enemy.id);
-    const relocated = w.capitals.get(p.id)!;
+    const relocated = w.supplyAnchors.get(p.id)!;
     expect(relocated).not.toEqual(previous);
     expect(w.map.get(key(relocated.x, relocated.y))?.owner).toBe(p.id);
   });
@@ -934,12 +942,10 @@ describe("authoritative rules", () => {
     expect(w.allCounts().get(a.id)).toMatchObject({
       robots: 1,
       soldiers: 1,
-      headquarters: 0,
     });
     expect(w.allCounts().get(b.id)).toMatchObject({
       robots: 0,
       soldiers: 1,
-      headquarters: 0,
     });
     const attacker = [...w.units.values()].find(
       (unit) => unit.ownerId === b.id && unit.kind === "attacker",

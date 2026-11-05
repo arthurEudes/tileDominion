@@ -4,7 +4,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import { GAME } from "@tile/game-config";
 import type { Player, Unit } from "./model.js";
 
-export const RUST_PROTOCOL_VERSION = 6;
+export const RUST_PROTOCOL_VERSION = 7;
 const DEFAULT_REQUEST_TIMEOUT_MS = 500;
 
 export function rustExecutablePath(platform = process.platform) {
@@ -239,7 +239,7 @@ export class RustEngine {
     map?: TileMap,
     dirtyTiles: Iterable<string> = [],
     dt = 1 / GAME.room.tickRate,
-    capitals?: ReadonlyMap<string, { x: number; y: number }>,
+    supplyAnchors?: ReadonlyMap<string, { x: number; y: number }>,
     returnSchedules = true,
   ) {
     const removedUnitIds = [...unitRemovals],
@@ -323,15 +323,20 @@ export class RustEngine {
         GAME.supply.updateIntervalMs,
         GAME.supply.decayMs,
         GAME.supply.decayStages,
-        GAME.supply.headquartersRadius,
+        GAME.supply.anchorRadius,
         GAME.supply.relayRadius,
         GAME.economy.incomeIntervalMs,
-        GAME.economy.incomePerTile,
+        GAME.economy.baseIncome,
+        GAME.economy.incomeTiers[0].upTo,
+        GAME.economy.incomeTiers[0].perTile,
+        GAME.economy.incomeTiers[1].upTo,
+        GAME.economy.incomeTiers[1].perTile,
+        GAME.economy.incomeTiers[2].perTile,
         GAME.supply.unsuppliedIncomeMultiplier,
       ],
       [...unitUpserts].map((unit) => this.unitTuple(unit)),
       removedUnitIds.map((id) => this.idFor(id)),
-      [...humanUpserts].map((player) => this.humanTuple(player, capitals?.get(player.id))),
+      [...humanUpserts].map((player) => this.humanTuple(player, supplyAnchors?.get(player.id))),
       removedHumanIds.map((id) => this.idFor(id)),
       mapInit,
       tileUpserts,
@@ -448,7 +453,7 @@ export class RustEngine {
     ];
   }
 
-  private humanTuple(player: Player, capital?: { x: number; y: number }) {
+  private humanTuple(player: Player, supplyAnchor?: { x: number; y: number }) {
     return [
       this.idFor(player.id), player.x, player.y,
       player.alive, player.isBot, player.invulnerableUntil,
@@ -458,7 +463,7 @@ export class RustEngine {
       player.captureKey ? this.tileIndex(player.captureKey) : null,
       player.captureSince ?? 0, player.upgrades?.speed ?? 0,
       player.upgrades?.capture ?? 0,
-      capital?.x ?? player.x, capital?.y ?? player.y,
+      supplyAnchor?.x ?? player.x, supplyAnchor?.y ?? player.y,
     ];
   }
 

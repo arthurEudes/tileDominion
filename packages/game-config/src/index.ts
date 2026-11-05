@@ -41,11 +41,15 @@ export const GAME = {
   economy: {
     startingMoney: 80,
     incomeIntervalMs: 1000,
-    incomePerTile: 0.12,
-    headquartersIncome: 5,
+    baseIncome: 5,
+    incomeTiers: [
+      { upTo: 100, perTile: 0.12 },
+      { upTo: 300, perTile: 0.07 },
+      { upTo: Number.POSITIVE_INFINITY, perTile: 0.03 },
+    ],
   },
   supply: {
-    headquartersRadius: 24,
+    anchorRadius: 24,
     relayRadius: 12,
     updateIntervalMs: 1000,
     decayMs: 45_000,
@@ -108,7 +112,6 @@ export const GAME = {
       turretDamage: 16,
       turretCooldownMs: 700,
     },
-    headquarters: { hp: 900 },
   },
   upgrades: {
     speed: { basePrice: 110, max: 3, bonus: 0.08 },
@@ -116,6 +119,21 @@ export const GAME = {
     capture: { basePrice: 120, max: 3 },
   },
 } as const;
+
+export function incomeForTerritory(effectiveTiles: number) {
+  let income = GAME.economy.baseIncome;
+  let previousLimit = 0;
+  for (const tier of GAME.economy.incomeTiers) {
+    const tilesInTier = Math.max(
+      0,
+      Math.min(effectiveTiles, tier.upTo) - previousLimit,
+    );
+    income += tilesInTier * tier.perTile;
+    if (effectiveTiles <= tier.upTo) break;
+    previousLimit = tier.upTo;
+  }
+  return Math.floor(income);
+}
 export const COLORS = [
   0x48dbfb, 0xff6b6b, 0x1dd1a1, 0xfeca57, 0x5f27cd, 0xff9ff3, 0x54a0ff,
   0xff9f43, 0x00d2d3, 0xc8d6e5,

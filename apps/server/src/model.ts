@@ -38,8 +38,7 @@ export type Unit = {
     | "soldier"
     | "attacker"
     | "defender"
-    | "bastion"
-    | "headquarters";
+    | "bastion";
   x: number;
   y: number;
   hp: number;

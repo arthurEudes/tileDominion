@@ -288,7 +288,6 @@ class Dominion extends Phaser.Scene {
       ["attacker", 16],
       ["defender", 18],
       ["bastion", 28],
-      ["headquarters", 38],
     ];
     const drawShape = (
       context: CanvasRenderingContext2D,
@@ -975,7 +974,7 @@ $("#play").onclick = async () => {
       if (full) clientUnits.clear();
       for (const u of created) {
         const kind: UnitView["kind"] = u[2] === 0 ? "robot" : u[2] === 1 ? "soldier"
-          : u[2] === 2 ? "bastion" : u[2] === 3 ? "headquarters"
+          : u[2] === 2 ? "bastion"
             : u[2] === 4 ? "attacker" : "defender";
         const bastionType: UnitView["bastionType"] = u[7] === 1 ? "fortress"
           : u[7] === 2 ? "factory" : u[7] === 3 ? "relay"

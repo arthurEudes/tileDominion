@@ -1,4 +1,4 @@
-import { GAME } from "@tile/game-config";
+import { GAME, incomeForTerritory } from "@tile/game-config";
 import type { BuyItem, Input, SoldierOrder } from "@tile/protocol";
 import {
   clamp,
@@ -24,7 +24,6 @@ const emptyUnitCounts = (): UnitCounts => ({
   attacker: 0,
   defender: 0,
   bastion: 0,
-  headquarters: 0,
 });
 export const NEUTRAL_OWNER_ID = "neutral";
 export class World {
@@ -47,7 +46,7 @@ export class World {
   readonly rustNetworkZones = new Map<string, Uint8Array>();
   readonly suppliedTiles = new Uint8Array(GAME.map.width * GAME.map.height);
   readonly wallTiles = new Set<string>();
-  readonly capitals = new Map<string, { x: number; y: number }>();
+  readonly supplyAnchors = new Map<string, { x: number; y: number }>();
   endsAt = Date.now() + GAME.room.durationMs;
   private serial = 0;
   private incomeElapsed = 0;
@@ -75,7 +74,7 @@ export class World {
       upgrades: { speed: 0, armor: 0, capture: 0 },
     };
     this.players.set(id, p);
-    this.capitals.set(id, { x: spot.x, y: spot.y });
+    this.supplyAnchors.set(id, { x: spot.x, y: spot.y });
     this.markPlayer(id);
     this.territoryCounts.set(id, 0);
     this.unitCounts.set(id, emptyUnitCounts());
@@ -435,7 +434,7 @@ export class World {
       this.map,
       rustTileChanges,
       dt,
-      this.capitals,
+      this.supplyAnchors,
       mirrorUnitSchedules,
         )
       : {
@@ -512,7 +511,6 @@ export class World {
       this.removeUnit(u.id);
       return;
     }
-    if (u.kind === "headquarters") return;
   }
   private applyRustUnitEffectsLegacy(u: Unit, now: number) {
     if (u.ownerId === NEUTRAL_OWNER_ID) return;
@@ -520,7 +518,6 @@ export class World {
       this.removeUnit(u.id);
       return;
     }
-    if (u.kind === "headquarters") return;
     if (u.kind === "bastion") {
       this.produceFromBastion(u, now);
       return;
@@ -615,13 +612,11 @@ export class World {
       this.incomeElapsed %= GAME.economy.incomeIntervalMs;
       for (const p of this.players.values())
         if (p.alive) {
-          p.money +=
-            Math.floor(
-              ((this.suppliedTerritoryCounts.get(p.id) ?? 0) +
-                (this.unsuppliedTerritoryCounts.get(p.id) ?? 0) *
-                  GAME.supply.unsuppliedIncomeMultiplier) *
-                GAME.economy.incomePerTile,
-            );
+          p.money += incomeForTerritory(
+            (this.suppliedTerritoryCounts.get(p.id) ?? 0) +
+              (this.unsuppliedTerritoryCounts.get(p.id) ?? 0) *
+                GAME.supply.unsuppliedIncomeMultiplier,
+          );
         }
     }
   }
@@ -686,7 +681,6 @@ export class World {
       this.removeUnit(u.id);
       return;
     }
-    if (u.kind === "headquarters") return;
     if (u.kind === "bastion") {
       this.produceFromBastion(u, now);
       return;
@@ -1020,9 +1014,9 @@ export class World {
     this.lastSupplyUpdate = now;
     this.suppliedTiles.fill(0);
     const sources = [
-      ...[...this.capitals.entries()]
+      ...[...this.supplyAnchors.entries()]
         .filter(([ownerId]) => this.players.get(ownerId)?.alive)
-        .map(([ownerId, capital]) => ({ ...capital, ownerId, supplyRadius: GAME.supply.headquartersRadius })),
+        .map(([ownerId, anchor]) => ({ ...anchor, ownerId, supplyRadius: GAME.supply.anchorRadius })),
       ...[...this.units.values()]
         .filter((unit) => unit.kind === "bastion" && unit.bastionType === "relay")
         .map((unit) => ({ ...unit, supplyRadius: GAME.supply.relayRadius })),
@@ -1121,24 +1115,24 @@ export class World {
       );
     this.dirtyTiles.add(k);
     this.rustDirtyTiles.add(k);
-    const previousCapital = previousOwner && this.capitals.get(previousOwner);
-    if (previousCapital && key(previousCapital.x, previousCapital.y) === k)
-      this.relocateCapital(previousOwner);
+    const previousAnchor = previousOwner && this.supplyAnchors.get(previousOwner);
+    if (previousAnchor && key(previousAnchor.x, previousAnchor.y) === k)
+      this.relocateSupplyAnchor(previousOwner);
   }
-  private relocateCapital(ownerId: string) {
+  private relocateSupplyAnchor(ownerId: string) {
     const replacement = this.safestOwnedTile(ownerId, true) ?? this.safestOwnedTile(ownerId);
-    if (replacement) this.capitals.set(ownerId, replacement);
-    else this.capitals.delete(ownerId);
+    if (replacement) this.supplyAnchors.set(ownerId, replacement);
+    else this.supplyAnchors.delete(ownerId);
   }
   private safestOwnedTile(ownerId: string, suppliedOnly = false) {
-    const capital = this.capitals.get(ownerId);
+    const anchor = this.supplyAnchors.get(ownerId);
     let best: { x: number; y: number } | undefined,
       bestScore = -1;
     for (let y = 0; y < GAME.map.height; y++)
       for (let x = 0; x < GAME.map.width; x++) {
         const tile = this.map.get(key(x, y));
         if (!tile || tile.owner !== ownerId || tile.obstacle) continue;
-        const supplied = this.isTileSupplied(x, y) || (capital?.x === x && capital.y === y);
+        const supplied = this.isTileSupplied(x, y) || (anchor?.x === x && anchor.y === y);
         if (suppliedOnly && !supplied) continue;
         let nearestEnemy = Number.POSITIVE_INFINITY;
         for (const player of this.players.values())
@@ -1164,7 +1158,6 @@ export class World {
         (units?.attacker ?? 0) +
         (units?.defender ?? 0),
       bastions: units?.bastion ?? 0,
-      headquarters: units?.headquarters ?? 0,
     };
   }
   allCounts() {
@@ -1175,7 +1168,6 @@ export class World {
         robots: number;
         soldiers: number;
         bastions: number;
-        headquarters: number;
       }
     >();
     for (const player of this.players.values()) counts.set(player.id, this.counts(player.id));
@@ -1197,7 +1189,7 @@ export class World {
   }
   neutralizePlayer(id: string) {
     const neutralizedUnits: string[] = [];
-    this.capitals.delete(id);
+    this.supplyAnchors.delete(id);
     for (const [tileKey, tile] of this.map)
       if (tile.owner === id) this.setOwner(tileKey, tile, null);
     for (const unit of this.units.values())
@@ -1225,7 +1217,7 @@ export class World {
   }
   removePlayer(id: string) {
     if (!this.players.delete(id)) return;
-    this.capitals.delete(id);
+    this.supplyAnchors.delete(id);
     this.unitCounts.delete(id);
     this.rustDirtyPlayers.delete(id);
     this.rustRemovedPlayers.set(id, ++this.rustVersion);

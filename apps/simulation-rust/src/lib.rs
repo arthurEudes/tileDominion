@@ -59,10 +59,15 @@ pub struct SimulationConfig {
     pub supply_update_interval_ms: u64,
     pub supply_decay_ms: u64,
     pub supply_decay_stages: u8,
-    pub supply_capital_radius: f32,
+    pub supply_anchor_radius: f32,
     pub supply_relay_radius: f32,
     pub income_interval_ms: u64,
-    pub income_per_tile: f32,
+    pub base_income: f32,
+    pub income_tier_one_limit: f32,
+    pub income_tier_one_rate: f32,
+    pub income_tier_two_limit: f32,
+    pub income_tier_two_rate: f32,
+    pub income_final_rate: f32,
     pub unsupplied_income_multiplier: f32,
 }
 
@@ -74,7 +79,6 @@ pub enum UnitKind {
     Attacker,
     Defender,
     Bastion,
-    Headquarters,
 }
 
 impl UnitKind {
@@ -156,9 +160,9 @@ pub struct HumanState {
     #[serde(default)]
     pub capture_upgrade: u8,
     #[serde(default)]
-    pub capital_x: f32,
+    pub supply_anchor_x: f32,
     #[serde(default)]
-    pub capital_y: f32,
+    pub supply_anchor_y: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -843,8 +847,8 @@ mod tests {
             capture_since: 0,
             speed_upgrade: 0,
             capture_upgrade: 0,
-            capital_x: x,
-            capital_y: 10.0,
+            supply_anchor_x: x,
+            supply_anchor_y: 10.0,
         }
     }
     fn config() -> SimulationConfig {
@@ -887,10 +891,15 @@ mod tests {
             supply_update_interval_ms: 1000,
             supply_decay_ms: 45_000,
             supply_decay_stages: 9,
-            supply_capital_radius: 24.0,
+            supply_anchor_radius: 24.0,
             supply_relay_radius: 12.0,
             income_interval_ms: 1000,
-            income_per_tile: 0.12,
+            base_income: 5.0,
+            income_tier_one_limit: 100.0,
+            income_tier_one_rate: 0.12,
+            income_tier_two_limit: 300.0,
+            income_tier_two_rate: 0.07,
+            income_final_rate: 0.03,
             unsupplied_income_multiplier: 0.5,
         }
     }

@@ -67,8 +67,7 @@ export type UnitView = {
     | "soldier"
     | "attacker"
     | "defender"
-    | "bastion"
-    | "headquarters";
+    | "bastion";
   x: number;
   y: number;
   hp: number;
@@ -206,11 +205,9 @@ export function expandSnapshot(
             ? "soldier"
             : u[3] === 2
               ? "bastion"
-              : u[3] === 3
-                ? "headquarters"
-                : u[3] === 4
-                  ? "attacker"
-                  : "defender",
+              : u[3] === 4
+                ? "attacker"
+                : "defender",
       x: u[4] / POSITION_SCALE,
       y: u[5] / POSITION_SCALE,
       hp: u[6],

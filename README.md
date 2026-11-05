@@ -96,7 +96,7 @@ Les sessions sont des jetons opaques valables 30 jours et conservés en mémoire
 
 - Déplacement du joueur : `WASD`, `ZQSD` ou flèches ; joystick sur mobile.
 - La capture d’une tuile demande 550 ms de base. Une tuile ennemie applique un multiplicateur ×3 et un robot un multiplicateur ×2.
-- Le territoire fourni rapporte des crédits chaque seconde. Le territoire non fourni rapporte moitié moins puis se neutralise après 45 secondes.
+- Chaque joueur vivant reçoit 5 crédits par seconde, même sans territoire. Le territoire fourni ajoute un revenu à rendement décroissant : 0,12 crédit par tuile jusqu’à 100, 0,07 de 101 à 300, puis 0,03 au-delà. Le territoire non fourni compte pour moitié puis se neutralise après 45 secondes.
 - Le joueur éliminé réapparaît sur sa tuile alliée la plus sûre. Sans territoire valide, il est éliminé.
 - Les attaquants peuvent être sélectionnés individuellement ou par rectangle, puis recevoir un ordre de suivi, de garde ou d’attaque.
 - Les IA remplacent les places humaines libres. Lorsqu’un humain rejoint une salle pleine d’IA, l’IA la plus faible est évincée.

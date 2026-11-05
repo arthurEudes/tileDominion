@@ -505,7 +505,7 @@ describe("Rust engine executable", () => {
         ...soldier,
         id: "u-enemy",
         ownerId: "p2",
-        kind: "headquarters",
+        kind: "bastion",
         x: 100,
         dirX: 0,
       } as Unit,

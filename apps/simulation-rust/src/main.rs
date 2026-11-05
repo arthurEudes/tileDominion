@@ -45,7 +45,7 @@ fn main() {
             break;
         };
         let decode_us = decode_started.elapsed().as_micros() as u64;
-        if request.protocol_version != 6 {
+        if request.protocol_version != 7 {
             break;
         }
         let sync_started = Instant::now();
@@ -521,7 +521,7 @@ fn main() {
                     UnitKind::Soldier | UnitKind::Attacker | UnitKind::Defender => {
                         config.soldier_speed
                     }
-                    UnitKind::Bastion | UnitKind::Headquarters => 0.0,
+                    UnitKind::Bastion => 0.0,
                 };
                 if !hold_position_for_capture
                     && speed > 0.0
@@ -743,9 +743,9 @@ fn main() {
                 .map(|human| {
                     (
                         human.id,
-                        human.capital_x + 0.5,
-                        human.capital_y + 0.5,
-                        config.supply_capital_radius,
+                        human.supply_anchor_x + 0.5,
+                        human.supply_anchor_y + 0.5,
+                        config.supply_anchor_radius,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -848,9 +848,17 @@ fn main() {
                         .get(&human.id)
                         .copied()
                         .unwrap_or_default();
-                    human.money += ((supplied_count as f32
-                        + unsupplied_count as f32 * config.unsupplied_income_multiplier)
-                        * config.income_per_tile)
+                    let effective_tiles = supplied_count as f32
+                        + unsupplied_count as f32 * config.unsupplied_income_multiplier;
+                    let tier_one = effective_tiles.min(config.income_tier_one_limit);
+                    let tier_two = (effective_tiles - config.income_tier_one_limit)
+                        .max(0.0)
+                        .min(config.income_tier_two_limit - config.income_tier_one_limit);
+                    let final_tier = (effective_tiles - config.income_tier_two_limit).max(0.0);
+                    human.money += (config.base_income
+                        + tier_one * config.income_tier_one_rate
+                        + tier_two * config.income_tier_two_rate
+                        + final_tier * config.income_final_rate)
                         .floor();
                 }
             }
@@ -888,7 +896,6 @@ fn main() {
                 UnitKind::Robot => 0u8,
                 UnitKind::Soldier => 1,
                 UnitKind::Bastion => 2,
-                UnitKind::Headquarters => 3,
                 UnitKind::Attacker => 4,
                 UnitKind::Defender => 5,
             };
