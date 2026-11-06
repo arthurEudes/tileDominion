@@ -1,21 +1,161 @@
 services:
-  server:
-    build: .
+  proxy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
     environment:
+      DOMAIN: ${DOMAIN:?Définir DOMAIN}
+      API_DOMAIN: ${API_DOMAIN:?Définir API_DOMAIN}
+      MONITOR_DOMAIN: ${MONITOR_DOMAIN:?Définir MONITOR_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?Définir ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      server:
+        condition: service_healthy
+      client:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      NODE_ENV: production
       PORT: 2567
-      CLIENT_URL: http://localhost:5173
-      STORAGE_DRIVER: ${STORAGE_DRIVER:-memory}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://tile:tile@postgres:5432/tile_dominion}
-    ports: ["2567:2567"]
+      CLIENT_URL: https://${DOMAIN:?Définir DOMAIN}
+      STORAGE_DRIVER: postgres
+      DATABASE_URL: ${DATABASE_URL:?Définir DATABASE_URL}
+    expose:
+      - "2567"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:2567/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   client:
-    build: .
-    command: npm run preview -w @tile/client -- --port 5173
-    environment: [VITE_SERVER_URL=http://localhost:2567]
-    ports: ["5173:5173"]
-    depends_on: [server]
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+      args:
+        VITE_SERVER_URL: https://${API_DOMAIN:?Définir API_DOMAIN}
+    restart: unless-stopped
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
   postgres:
     image: postgres:17-alpine
-    profiles: [persistent]
-    environment: [POSTGRES_USER=tile, POSTGRES_PASSWORD=tile, POSTGRES_DB=tile_dominion]
-    volumes: [tile_data:/var/lib/postgresql/data]
-volumes: {tile_data: {}}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tile}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Définir POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-tile_dominion}
+    volumes:
+      - tile_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v3.7.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      server:
+        condition: service_healthy
+      alertmanager:
+        condition: service_started
+
+  alertmanager:
+    image: prom/alertmanager:v0.29.0
+    restart: unless-stopped
+    environment:
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:?Définir ALERT_WEBHOOK_URL}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        sed "s|__ALERT_WEBHOOK_URL__|$${ALERT_WEBHOOK_URL}|g"
+        /etc/alertmanager/alertmanager.yml.template > /tmp/alertmanager.yml &&
+        exec /bin/alertmanager --config.file=/tmp/alertmanager.yml --storage.path=/alertmanager
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml.template:/etc/alertmanager/alertmanager.yml.template:ro
+      - alertmanager_data:/alertmanager
+
+  loki:
+    image: grafana/loki:3.5.7
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+
+  promtail:
+    image: grafana/promtail:3.5.7
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./deploy/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:12.2.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Définir GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: https://${MONITOR_DOMAIN:?Définir MONITOR_DOMAIN}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  tile_data:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  alertmanager_data:
+  loki_data:
+  grafana_data:

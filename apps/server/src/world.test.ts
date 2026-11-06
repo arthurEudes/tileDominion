@@ -496,57 +496,17 @@ describe("authoritative rules", () => {
     expect({ x: defender.x, y: defender.y }).toEqual(before);
     expect([defender.dirX, defender.dirY]).toEqual([0, 0]);
   });
-  it("blocks allied and enemy movement with a destructible wall", () => {
+  it("rejects removed wall and turret structures", () => {
     const w = world(),
       owner = w.addPlayer("owner", "Owner", 1),
-      enemy = w.addPlayer("enemy", "Enemy", 2),
-      wallX = Math.floor(owner.x) + 2,
-      wallY = Math.floor(owner.y);
+      x = Math.floor(owner.x) + 1,
+      y = Math.floor(owner.y);
     owner.money = 9999;
-    expect(w.placeBastion(owner.id, wallX, wallY, "wall", 1000)).toBe(true);
-    const wall = [...w.units.values()].find(
-      (unit) => unit.bastionType === "wall",
-    )!;
-    expect(wall.hp).toBe(GAME.units.bastion.wallHp);
-
-    for (const player of [owner, enemy]) {
-      player.x = wallX - 0.2;
-      player.y = wallY + 0.5;
-      player.input = { x: 1, y: 0, attack: false, seq: 1 };
-      const before = player.x;
-      w.tickPlayer(player, 0.2, 2000);
-      expect(player.x).toBe(before);
-    }
-
-    w.damageUnit(wall, 9999);
-    expect(w.wallTiles.has(key(wallX, wallY))).toBe(false);
-    owner.input.seq++;
-    w.tickPlayer(owner, 0.2, 3000);
-    expect(owner.x).toBeGreaterThan(wallX);
-  });
-  it("makes turrets automatically damage the nearest enemy", () => {
-    const w = world(),
-      owner = w.addPlayer("owner", "Owner", 1),
-      enemy = w.addPlayer("enemy", "Enemy", 2),
-      turretX = Math.floor(owner.x) + 1,
-      turretY = Math.floor(owner.y);
-    owner.money = enemy.money = 9999;
-    expect(
-      w.placeBastion(owner.id, turretX, turretY, "turret", 1000),
-    ).toBe(true);
-    w.buy(enemy.id, "robot");
-    const turret = [...w.units.values()].find(
-        (unit) => unit.bastionType === "turret",
-      )!,
-      robot = [...w.units.values()].find(
-        (unit) => unit.ownerId === enemy.id && unit.kind === "robot",
-      )!;
-    robot.x = turret.x + 2;
-    robot.y = turret.y;
-    const hp = robot.hp;
-    w.spatial.rebuild(w.players.values(), w.units.values());
-    w.tickUnit(turret, 0, 2000);
-    expect(robot.hp).toBe(hp - GAME.units.bastion.turretDamage);
+    expect(w.placeBastion(owner.id, x, y, "wall", 1000)).toBe(false);
+    expect(w.placeBastion(owner.id, x, y, "turret", 1000)).toBe(false);
+    expect([...w.units.values()].some((unit) =>
+      unit.bastionType === "wall" || unit.bastionType === "turret"
+    )).toBe(false);
   });
   it("halves isolated territory income and eventually neutralizes it", () => {
     const w = world(),
@@ -846,47 +806,31 @@ describe("authoritative rules", () => {
     expect(robot.x).toBeGreaterThanOrEqual(0.15);
     expect(robot.y).toBeLessThanOrEqual(GAME.map.height - 0.15);
   });
-  it("speed upgrades increase actual server movement", () => {
+  it("gives players the former maximum movement speed by default", () => {
     const base = world(),
-      upgraded = world(),
-      a = base.addPlayer("a", "A", 1),
-      b = upgraded.addPlayer("b", "B", 2);
-    b.money = 999;
-    expect(upgraded.buy("b", "speed")).toBe(true);
+      a = base.addPlayer("a", "A", 1);
     a.input = { x: 1, y: 0, attack: false, seq: 1 };
-    b.input = { x: 1, y: 0, attack: false, seq: 1 };
-    const ax = a.x,
-      bx = b.x;
+    const ax = a.x;
     base.tickPlayer(a, 0.1, 1000);
-    upgraded.tickPlayer(b, 0.1, 1000);
     expect(a.x - ax).toBeCloseTo(GAME.player.speed * 0.1);
-    expect(b.x - bx).toBeCloseTo(
-      GAME.player.speed * (1 + GAME.upgrades.speed.bonus) * 0.1,
-    );
+    expect(GAME.player.speed).toBeCloseTo(5.2 * 1.24);
   });
-  it("armor upgrades immediately increase current and maximum hp", () => {
+  it("gives players the former maximum armor by default", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1);
-    p.money = 999;
-    const hp = p.hp,
-      maxHp = p.maxHp;
-    expect(w.buy("a", "armor")).toBe(true);
-    expect(p.hp).toBe(hp + GAME.upgrades.armor.hp);
-    expect(p.maxHp).toBe(maxHp + GAME.upgrades.armor.hp);
+    expect(p.hp).toBe(160);
+    expect(p.maxHp).toBe(160);
   });
-  it("capture upgrades reduce the real capture duration", () => {
+  it("uses the former maximum capture speed by default", () => {
     const w = world(),
       p = w.addPlayer("a", "A", 1);
-    p.money = 999;
-    expect(w.buy("a", "capture")).toBe(true);
     const t = w.map.get(key(Math.floor(p.x) + 3, Math.floor(p.y)))!;
     t.owner = null;
     p.x += 3;
     w.tickPlayer(p, 0, 1000);
-    const upgradedDelay = GAME.capture.holdMs * GAME.capture.improvedMultiplier;
-    w.tickPlayer(p, 0, 1000 + upgradedDelay + 1);
+    w.tickPlayer(p, 0, 1000 + GAME.capture.holdMs + 1);
     expect(t.owner).toBe("a");
-    expect(upgradedDelay).toBeLessThan(GAME.capture.holdMs);
+    expect(GAME.capture.holdMs).toBe(375);
   });
   it("converts a disconnected human to a bot without losing its empire", () => {
     const w = world(),

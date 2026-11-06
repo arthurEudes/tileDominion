@@ -7,7 +7,7 @@ Jeu `.io` multijoueur de conquête en pixel art. Chaque joueur étend son territ
 Le projet est un MVP multijoueur jouable sur une instance serveur unique :
 
 - salles de 50 joueurs logiques, humains et IA cumulés ;
-- partie de 10 minutes sur une carte procédurale de 404×404 tuiles ;
+- partie de 15 minutes sur une carte procédurale de 404×404 tuiles ;
 - serveur autoritaire à 20 Hz et diffusion réseau par intérêt spatial à 10 Hz ;
 - simulation persistante des joueurs, unités, combats, captures, production et ravitaillement dans un moteur Rust ;
 - client Phaser avec interpolation, sélection d’unités, contrôles clavier et tactiles ;
@@ -71,6 +71,11 @@ Le nombre de clients créés par `npm run bots` est contrôlé par `BOT_COUNT`. 
 | `BOT_COUNT` | `12` | Nombre de clients créés par `npm run bots` |
 | `STORAGE_DRIVER` | `memory` | Stockage des comptes : `memory` ou `postgres` |
 | `DATABASE_URL` | — | Connexion PostgreSQL requise avec `STORAGE_DRIVER=postgres` |
+| `MONITOR_DOMAIN` | — | Domaine HTTPS de Grafana en production |
+| `GRAFANA_ADMIN_USER` | `admin` | Administrateur initial de Grafana |
+| `GRAFANA_ADMIN_PASSWORD` | — | Mot de passe administrateur Grafana |
+| `GRAFANA_PORT` | `3000` | Port local publié par Grafana |
+| `ALERT_WEBHOOK_URL` | — | Webhook recevant les alertes Alertmanager |
 
 ## Comptes et classement global
 
@@ -84,7 +89,7 @@ points = arrondi(tuiles possédées / tuiles capturables de la carte × 1000)
 
 Une récompense est identifiée par la partie et le compte, ce qui rend une nouvelle tentative d’écriture sans risque de double crédit. Les routes HTTP disponibles sont :
 
-Après l’attribution, la salle lance immédiatement une nouvelle partie de 10 minutes sur une nouvelle carte. Les clients et leurs comptes restent connectés, tandis que le monde, les IA, le moteur Rust et les caches réseau sont recréés.
+Après l’attribution, la salle lance immédiatement une nouvelle partie de 15 minutes sur une nouvelle carte. Les clients et leurs comptes restent connectés, tandis que le monde, les IA, le moteur Rust et les caches réseau sont recréés.
 
 - `POST /auth/register` avec `{ "username": "...", "password": "..." }` ;
 - `POST /auth/login` avec les mêmes champs ;
@@ -95,7 +100,7 @@ Les sessions sont des jetons opaques valables 30 jours et conservés en mémoire
 ## Règles et contrôles
 
 - Déplacement du joueur : `WASD`, `ZQSD` ou flèches ; joystick sur mobile.
-- La capture d’une tuile demande 550 ms de base. Une tuile ennemie applique un multiplicateur ×3 et un robot un multiplicateur ×2.
+- La capture d’une tuile par le joueur demande 375 ms. Une tuile ennemie applique un multiplicateur ×3 et un robot un multiplicateur ×2.
 - Chaque joueur vivant reçoit 5 crédits par seconde, même sans territoire. Le territoire fourni ajoute un revenu à rendement décroissant : 0,12 crédit par tuile jusqu’à 100, 0,07 de 101 à 300, puis 0,03 au-delà. Le territoire non fourni compte pour moitié puis se neutralise après 45 secondes.
 - Le joueur éliminé réapparaît sur sa tuile alliée la plus sûre. Sans territoire valide, il est éliminé.
 - Les attaquants peuvent être sélectionnés individuellement ou par rectangle, puis recevoir un ordre de suivi, de garde ou d’attaque.
@@ -111,10 +116,8 @@ Les sessions sont des jetons opaques valables 30 jours et conservés en mémoire
 | Forteresse | 480 | Produit jusqu’à 8 défenseurs |
 | Usine | 480 | Produit des robots |
 | Relais | 480 | Étend la zone de ravitaillement |
-| Mur | 90 | Bloque les déplacements, 750 PV |
-| Tourelle | 420 | Attaque automatiquement à distance |
 
-Le joueur commence avec 80 crédits. Les unités mobiles n’ont actuellement pas de plafond numérique configuré ; leurs coûts et le budget CPU constituent les limites pratiques. Les améliorations de vitesse, d’armure et de capture ont trois niveaux.
+Le joueur commence avec 80 crédits, 160 PV et les anciennes valeurs maximales de vitesse et de capture directement intégrées à ses statistiques de base. Les unités mobiles n’ont actuellement pas de plafond numérique configuré ; leurs coûts et le budget CPU constituent les limites pratiques. Un clic sur une case ouvre les trois choix de bâtiment : forteresse, usine ou relais.
 
 Les valeurs d’équilibrage de référence se trouvent dans `packages/game-config/src/index.ts`.
 
@@ -187,27 +190,66 @@ Dernière mesure locale indicative, sans serveur de développement concurrent :
 
 Ces chiffres dépendent de la machine et ne constituent pas une garantie de capacité en production. La salle accepte 50 joueurs, mais un test réseau mesuré avec 50 véritables clients simultanés reste nécessaire.
 
-## Docker
+## Déploiement Docker en production
 
-Pour lancer le serveur et le client :
+La production utilise des services isolés :
+
+- Caddy reçoit le trafic public sur les ports 80 et 443, obtient et renouvelle les certificats TLS et transmet les WebSockets ;
+- Nginx sert le client compilé comme fichiers statiques avec un cache long pour les assets versionnés ;
+- le serveur Node/Colyseus et son moteur Rust ne sont accessibles que depuis le réseau Docker ;
+- PostgreSQL conserve les comptes et les scores dans le volume `tile_data`.
+- Prometheus collecte les métriques, Alertmanager envoie les alertes, Loki centralise les logs et Grafana présente le tableau de bord.
+
+Créer trois enregistrements DNS de type `A`/`AAAA` pointant vers le serveur, par exemple `game.example.com`, `api.game.example.com` et `monitor.game.example.com`. Les ports 80 et 443 doivent être accessibles depuis Internet. Préparer ensuite la configuration :
 
 ```bash
-docker compose up --build
+cp .env.production.example .env.production
 ```
 
-Pour démarrer également PostgreSQL :
+Renseigner des domaines réels, l’adresse ACME et un mot de passe PostgreSQL robuste. `DATABASE_URL` doit contenir le même utilisateur et mot de passe que les variables PostgreSQL. Lancer enfin :
 
 ```bash
-STORAGE_DRIVER=postgres docker compose --profile persistent up --build
+docker compose --env-file .env.production up -d --build
 ```
 
-Le serveur crée automatiquement les tables `accounts` et `match_scores`. PostgreSQL conserve les comptes, les scores cumulés et le registre idempotent des récompenses dans le volume `tile_data`.
+`VITE_SERVER_URL` est injectée pendant la construction de l’image client ; le navigateur utilise donc directement l’URL HTTPS publique de `API_DOMAIN`. Les connexions Colyseus deviennent automatiquement des WebSockets sécurisés derrière Caddy.
+
+Les données TLS sont conservées dans `caddy_data`, la configuration Caddy dans `caddy_config` et PostgreSQL dans `tile_data`. Les volumes `prometheus_data`, `loki_data`, `alertmanager_data` et `grafana_data` conservent la supervision. Le serveur crée actuellement les tables `accounts` et `match_scores` au démarrage.
+
+Pour suivre le déploiement :
+
+```bash
+docker compose --env-file .env.production ps
+docker compose --env-file .env.production logs -f proxy server
+```
+
+## Supervision
+
+Le serveur écrit une ligne JSON par événement avec `timestamp`, `level`, `service` et `message`. Les événements de jeu incluent `roomId` et `matchId`, notamment pour la création des salles, les connexions, les fins de partie, les dépassements de tick et les erreurs Rust. Promtail ajoute les labels Docker et expédie ces journaux vers Loki.
+
+`GET /metrics` expose à Prometheus :
+
+- CPU, mémoire, heap, event loop et métriques Node standard ;
+- salles, joueurs et connexions WebSocket actifs ;
+- histogrammes de durée des ticks et des allers-retours Rust ;
+- dépassements de budget, délais et crashs Rust ;
+- erreurs HTTP et erreurs remontées par les navigateurs.
+
+Cette route reste accessible sur le réseau Docker mais Caddy la masque sur l’API publique. Le client transmet les erreurs JavaScript et les promesses rejetées à `POST /client-errors`, avec les identifiants de salle et de partie lorsqu’ils sont connus.
+
+`GET /health` effectue un `SELECT 1` réel dans PostgreSQL et une requête IPC réelle vers un moteur Rust dédié. Il répond `503` si un composant est indisponible ou pendant l’arrêt du serveur.
+
+Prometheus déclenche des alertes pour une instance indisponible, un crash ou des délais Rust, un p95 de tick supérieur à 50 ms, une rafale de dépassements, une mémoire supérieure à 1,5 Go ou une rafale d’erreurs navigateur. Alertmanager les envoie vers `ALERT_WEBHOOK_URL`. Grafana est publié sur `MONITOR_DOMAIN` avec le dashboard **Tile Dominion — Production** préinstallé.
+
+Dès que la stack Docker est lancée, Grafana est également disponible localement sur <http://localhost:3000>. Le port peut être changé avec `GRAFANA_PORT`. Il est lié uniquement à `127.0.0.1`, afin de ne pas contourner l’accès HTTPS du domaine de supervision sur un serveur public.
+
+Sur `SIGTERM` ou `SIGINT`, Colyseus ferme les salles, les moteurs Rust, les sessions et PostgreSQL avant de quitter. Docker accorde 20 secondes avant de forcer l’arrêt.
 
 ## Limites avant production distribuée
 
 - sessions partagées entre plusieurs processus (actuellement locales au processus) ;
 - Redis Presence et coordination de plusieurs processus Colyseus ;
 - matchmaking distribué et reprise d’une salle après panne ;
-- observabilité durable : métriques, traces, alertes et historique de charge ;
+- traces distribuées entre plusieurs processus ;
 - tests longue durée avec 50 clients réels, latence et pertes réseau ;
 - découpage du bundle client, actuellement volumineux.

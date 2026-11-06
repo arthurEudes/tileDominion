@@ -3,6 +3,13 @@ import { fileURLToPath } from "node:url";
 import { decode, encode } from "@msgpack/msgpack";
 import { GAME } from "@tile/game-config";
 import type { Player, Unit } from "./model.js";
+import { logger } from "./logger.js";
+import {
+  rustCrashes,
+  rustEnginesGauge,
+  rustRoundTrip,
+  rustTimeouts,
+} from "./telemetry.js";
 
 export const RUST_PROTOCOL_VERSION = 7;
 const DEFAULT_REQUEST_TIMEOUT_MS = 500;
@@ -98,11 +105,14 @@ export class RustEngine {
     lastRoundTripMs: 0,
   };
   lastMetrics?: RustMetrics;
+  private countedAsActive = false;
 
-  constructor() {
+  constructor(private context: () => Record<string, unknown> = () => ({})) {
     this.child = spawn(rustExecutablePath(), [], {
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.countedAsActive = true;
+    rustEnginesGauge.inc();
     this.child.stdout.on("data", (chunk: Buffer) => {
       this.output = Buffer.concat([this.output, chunk]);
       while (this.output.length >= 4) {
@@ -122,6 +132,7 @@ export class RustEngine {
           this.updateInFlight();
           this.transportMetrics.completed++;
           this.transportMetrics.lastRoundTripMs = Date.now() - pending.startedAt;
+          rustRoundTrip.observe(this.transportMetrics.lastRoundTripMs / 1000);
           this.lastMetrics = wireMetrics
             ? {
                 decode_us: wireMetrics[0],
@@ -174,17 +185,32 @@ export class RustEngine {
       }
     });
     this.child.on("exit", (code) => {
+      const unexpected = !this.closed;
       this.closed = true;
+      this.markInactive();
       const error = new Error(`Le moteur Rust s'est arrêté (${code ?? "inconnu"})`);
+      if (unexpected) {
+        rustCrashes.inc();
+        logger.error("rust_process_exited", { ...this.context(), code, error });
+      }
       this.failAll(error);
     });
     this.child.on("error", (error) => {
+      const unexpected = !this.closed;
       this.closed = true;
+      this.markInactive();
       this.startError = error;
+      if (unexpected) {
+        rustCrashes.inc();
+        logger.error("rust_process_error", { ...this.context(), error });
+      }
       this.failAll(error);
     });
     this.child.stderr.on("data", (chunk: Buffer) => {
-      console.error(`Moteur Rust: ${chunk.toString().trimEnd()}`);
+      logger.error("rust_stderr", {
+        ...this.context(),
+        output: chunk.toString().trimEnd(),
+      });
     });
   }
 
@@ -352,7 +378,19 @@ export class RustEngine {
   }
 
   close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.markInactive();
     this.child.kill();
+  }
+
+  async healthcheck() {
+    if (this.closed || this.startError || this.child.exitCode !== null) return false;
+    await this.scheduleDeltaWithEvents(
+      Date.now(), [], [], [], [], this.mapInitialized ? undefined : new Map(), [],
+      1 / GAME.room.tickRate, undefined, false,
+    );
+    return true;
   }
 
   invalidateMap() {
@@ -380,8 +418,13 @@ export class RustEngine {
       const timeout = setTimeout(() => {
         if (!this.pending.delete(requestId)) return;
         this.transportMetrics.timedOut++;
+        rustTimeouts.inc();
         this.updateInFlight();
-        reject(new Error(`Délai Rust dépassé pour la requête ${requestId}`));
+        const error = new Error(`Délai Rust dépassé pour la requête ${requestId}`);
+        logger.error("rust_request_timeout", {
+          ...this.context(), requestId, timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+        });
+        reject(error);
       }, DEFAULT_REQUEST_TIMEOUT_MS);
       this.pending.set(requestId, { resolve, reject, timeout, startedAt: Date.now() });
       this.updateInFlight();
@@ -411,6 +454,12 @@ export class RustEngine {
       this.transportMetrics.peakInFlight,
       this.pending.size,
     );
+  }
+
+  private markInactive() {
+    if (!this.countedAsActive) return;
+    this.countedAsActive = false;
+    rustEnginesGauge.dec();
   }
 
   private failAll(error: Error) {

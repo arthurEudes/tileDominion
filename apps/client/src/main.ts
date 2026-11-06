@@ -8,14 +8,74 @@ import {
   type UnitView,
 } from "@tile/protocol";
 import { GAME } from "@tile/game-config";
+import { MenuBattle } from "./menu-battle";
 import "./style.css";
+const menuBattle = new MenuBattle(document.querySelector("#menuBattle") as HTMLCanvasElement);
 let room: Room | null = null,
   myId = "",
   snap: ClientSnapshot | null = null,
   seq = 0,
   sceneRef: Dominion | null = null;
 const serverUrl = import.meta.env.VITE_SERVER_URL ?? "http://localhost:2567";
-type Account = { id: string; username: string; score: number };
+const errorContext = { roomId: "", matchId: "" };
+let lastReportedError = "";
+function reportClientError(kind: "error" | "unhandledrejection", error: unknown, source?: string) {
+  const value = error instanceof Error ? error : new Error(String(error));
+  const fingerprint = `${kind}:${value.message}:${source ?? ""}`;
+  if (fingerprint === lastReportedError) return;
+  lastReportedError = fingerprint;
+  void fetch(`${serverUrl}/client-errors`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      kind,
+      message: value.message,
+      stack: value.stack,
+      source,
+      ...errorContext,
+    }),
+    keepalive: true,
+  }).catch(() => {});
+}
+window.addEventListener("error", (event) =>
+  reportClientError("error", event.error ?? event.message, event.filename));
+window.addEventListener("unhandledrejection", (event) =>
+  reportClientError("unhandledrejection", event.reason));
+type Account = {
+  id: string;
+  username: string;
+  score: number;
+  country: string;
+  bestTerritory: number;
+};
+type RankChange = { before: number; after: number; gained: number } | null;
+type MatchResult = {
+  points: number;
+  score: number;
+  authenticated: boolean;
+  country: string;
+  placement: number;
+  totalPlayers: number;
+  winner: string;
+  standings: Array<{
+    id: string;
+    name: string;
+    tiles: number;
+    kills: number;
+    isBot: boolean;
+  }>;
+  rankings: { world: RankChange; country: RankChange } | null;
+  stats: {
+    maxTerritory: number;
+    tilesCaptured: number;
+    tilesLost: number;
+    kills: number;
+    unitsProduced: number;
+    buildingsProduced: number;
+    territoryHistory: Array<[number, number]>;
+  };
+  personalBest: { value: number; isNew: boolean };
+};
 let authToken = localStorage.getItem("tileDominionToken") ?? "";
 let account: Account | null = (() => {
   try {
@@ -47,6 +107,7 @@ function setAccount(next: Account | null, token = "") {
     $("#accountStatus").textContent = `${next.username} · ${next.score} points`;
     $("#play").textContent = `JOUER AVEC ${next.username.toUpperCase()}`;
     (document.querySelector("#name") as HTMLInputElement).value = next.username;
+    (document.querySelector("#country") as HTMLInputElement).value = next.country ?? "XX";
   } else {
     localStorage.removeItem("tileDominionToken");
     localStorage.removeItem("tileDominionAccount");
@@ -58,13 +119,18 @@ function setAccount(next: Account | null, token = "") {
 async function authenticate(path: "login" | "register") {
   const username = (document.querySelector("#name") as HTMLInputElement).value.trim();
   const password = (document.querySelector("#password") as HTMLInputElement).value;
+  const country = (document.querySelector("#country") as HTMLInputElement).value;
   const status = $("#accountStatus");
   status.textContent = path === "register" ? "Création du compte…" : "Connexion…";
   try {
     const response = await fetch(`${serverUrl}/auth/${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({
+        username,
+        password,
+        ...(path === "register" ? { country } : {}),
+      }),
     });
     const body = await response.json() as { token?: string; account?: Account; error?: string };
     if (!response.ok || !body.token || !body.account)
@@ -92,6 +158,130 @@ async function loadGlobalLeaderboard() {
     target.textContent = "Classement indisponible.";
   }
 }
+
+const COSMETICS = [
+  { score: 0, name: "Étendard de recrue", icon: "◆" },
+  { score: 50, name: "Bannière azur", icon: "◇" },
+  { score: 150, name: "Bordure conquérant", icon: "⬡" },
+  { score: 300, name: "Trace émeraude", icon: "✦" },
+  { score: 500, name: "Forteresse royale", icon: "♜" },
+  { score: 800, name: "Couronne du Dominion", icon: "♛" },
+];
+
+function rankLabel(change: RankChange, gainTarget: HTMLElement) {
+  if (!change) {
+    gainTarget.textContent = "Compte ou pays requis";
+    return "—";
+  }
+  gainTarget.textContent = change.gained
+    ? change.gained > 0
+      ? `▲ ${change.gained} place${change.gained > 1 ? "s" : ""}`
+      : `▼ ${Math.abs(change.gained)} place${change.gained < -1 ? "s" : ""}`
+    : "Position maintenue";
+  return `#${change.after}`;
+}
+
+function cosmeticFor(score: number) {
+  let index = 0;
+  while (index + 1 < COSMETICS.length && score >= COSMETICS[index + 1].score)
+    index++;
+  const current = COSMETICS[index];
+  const next = COSMETICS[index + 1];
+  const progress = next
+    ? (score - current.score) / (next.score - current.score)
+    : 1;
+  return { current, next, progress: Math.max(0, Math.min(1, progress)) };
+}
+
+function showMatchEnd(result: MatchResult) {
+  const won = result.placement === 1;
+  $("#endTitle").textContent = won ? "VICTOIRE" : `TOP ${result.placement}`;
+  $("#endWinner").textContent = won
+    ? "Votre royaume domine la carte."
+    : `${result.winner} remporte cette bataille.`;
+  $("#endPlacement").innerHTML =
+    `<strong>#${result.placement} / ${result.totalPlayers}</strong>` +
+    `<span>${result.authenticated ? `+${result.points} points · ${result.score} au total` : "Partie invitée · score non enregistré"}</span>`;
+  const countryGain = $("#countryRankGain");
+  const worldGain = $("#worldRankGain");
+  $("#countryRank").textContent = rankLabel(result.rankings?.country ?? null, countryGain);
+  $("#worldRank").textContent = rankLabel(result.rankings?.world ?? null, worldGain);
+  const countryLabel = result.country === "XX" ? "PAYS" : `PAYS · ${result.country}`;
+  $("#countryRank").parentElement!.querySelector("span")!.textContent = `CLASSEMENT ${countryLabel}`;
+  const stats = [
+    ["Territoire maximal", result.stats.maxTerritory],
+    ["Cases capturées", result.stats.tilesCaptured],
+    ["Cases perdues", result.stats.tilesLost],
+    ["Éliminations", result.stats.kills],
+    ["Unités produites", result.stats.unitsProduced],
+    ["Bâtiments produits", result.stats.buildingsProduced],
+  ];
+  $("#endStats").innerHTML = stats.map(([label, value]) =>
+    `<article><span>${label}</span><strong>${value}</strong></article>`,
+  ).join("") +
+    `<article class="record"><span>${result.personalBest.isNew ? "NOUVEAU RECORD" : "Record personnel"}</span><strong>${result.personalBest.value}</strong></article>`;
+  $("#territoryPeak").textContent = `PIC · ${result.stats.maxTerritory}`;
+  const cosmetic = cosmeticFor(result.score);
+  $("#cosmeticIcon").textContent = cosmetic.current.icon;
+  $("#cosmeticName").textContent = cosmetic.current.name;
+  $("#cosmeticNext").textContent = cosmetic.next
+    ? `${result.score}/${cosmetic.next.score} points · prochain : ${cosmetic.next.name}`
+    : "Collection actuelle terminée";
+  ($("#cosmeticProgress") as HTMLElement).style.width = `${cosmetic.progress * 100}%`;
+  $("#finalStandings").innerHTML = result.standings.map((entry, index) =>
+    `<li class="${entry.id === myId ? "me" : ""} ${index === 0 ? "winner" : ""}">` +
+    `<b>${index + 1}</b><span>${escapeHtml(entry.name)}${entry.isBot ? " <small>IA</small>" : ""}</span>` +
+    `<em>${entry.tiles} ▦</em></li>`,
+  ).join("");
+  $("#matchEnd").hidden = false;
+  requestAnimationFrame(() => drawTerritoryChart(result.stats.territoryHistory));
+}
+
+function drawTerritoryChart(points: Array<[number, number]>) {
+  const canvas = document.querySelector("#territoryChart") as HTMLCanvasElement;
+  const width = Math.max(320, Math.floor(canvas.clientWidth * devicePixelRatio));
+  const height = Math.max(130, Math.floor(canvas.clientHeight * devicePixelRatio));
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.clearRect(0, 0, width, height);
+  const padding = 16 * devicePixelRatio;
+  const values = points.length ? points : [[0, 0] as [number, number]];
+  const maxTime = Math.max(1, ...values.map(([time]) => time));
+  const maxTiles = Math.max(1, ...values.map(([, tiles]) => tiles));
+  const position = ([time, tiles]: [number, number]) => ({
+    x: padding + (time / maxTime) * (width - padding * 2),
+    y: height - padding - (tiles / maxTiles) * (height - padding * 2),
+  });
+  context.strokeStyle = "#28445d";
+  context.lineWidth = devicePixelRatio;
+  for (let row = 0; row <= 3; row++) {
+    const y = padding + (row / 3) * (height - padding * 2);
+    context.beginPath(); context.moveTo(padding, y); context.lineTo(width - padding, y); context.stroke();
+  }
+  const gradient = context.createLinearGradient(0, padding, 0, height);
+  gradient.addColorStop(0, "#39e6d088");
+  gradient.addColorStop(1, "#39e6d005");
+  context.beginPath();
+  values.forEach((point, index) => {
+    const { x, y } = position(point);
+    if (index) context.lineTo(x, y); else context.moveTo(x, y);
+  });
+  const last = position(values.at(-1)!);
+  context.lineTo(last.x, height - padding);
+  context.lineTo(position(values[0]).x, height - padding);
+  context.closePath(); context.fillStyle = gradient; context.fill();
+  context.beginPath();
+  values.forEach((point, index) => {
+    const { x, y } = position(point);
+    if (index) context.lineTo(x, y); else context.moveTo(x, y);
+  });
+  context.strokeStyle = "#39e6d0";
+  context.lineWidth = 3 * devicePixelRatio;
+  context.lineJoin = "round";
+  context.stroke();
+}
 class Dominion extends Phaser.Scene {
   tileChunks = new Map<
     string,
@@ -101,6 +291,7 @@ class Dominion extends Phaser.Scene {
     }
   >();
   tileColors = new Map<string, number>();
+  tileOwners = new Map<string, string | null>();
   obstacles = new Set<string>();
   mapBase?: Phaser.GameObjects.Rectangle;
   actors = new Map<string, Phaser.GameObjects.Container>();
@@ -131,14 +322,10 @@ class Dominion extends Phaser.Scene {
   selected = new Set<number>();
   unitServerIds = new Map<number, string>();
   pendingAction:
-    | "fortress"
-    | "factory"
-    | "relay"
-    | "wall"
-    | "turret"
     | "guard"
     | "attack"
     | null = null;
+  buildTile?: { x: number; y: number };
   selectionStart?: Phaser.Math.Vector2;
   selectionBox?: Phaser.GameObjects.Rectangle;
   cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -157,6 +344,7 @@ class Dominion extends Phaser.Scene {
     for (const bob of this.unitOutlineBobs.values()) bob.destroy();
     this.tileChunks.clear();
     this.tileColors.clear();
+    this.tileOwners.clear();
     this.obstacles.clear();
     this.actors.clear();
     this.unitBobs.clear();
@@ -167,40 +355,43 @@ class Dominion extends Phaser.Scene {
     this.selected.clear();
     this.unitServerIds.clear();
     this.pendingAction = null;
+    this.buildTile = undefined;
+    $("#buildMenu").hidden = true;
   }
   create() {
     sceneRef = this;
     this.cameras.main.setBackgroundColor(0x0a1827);
     this.cursors = this.input.keyboard!.createCursorKeys();
     this.keys = this.input.keyboard!.addKeys("W,A,S,D,Z,Q");
+    this.input.mouse?.disableContextMenu();
     this.cameras.main.setZoom(1.15);
     this.createUnitBatches();
     this.setupTouch();
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
-      const point = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+      const point = this.cameras.main.getWorldPoint(pointer.x, pointer.y),
+        buildMenuWasOpen = !$("#buildMenu").hidden;
+      $("#buildMenu").hidden = true;
+      if (pointer.rightButtonDown()) {
+        this.buildTile = undefined;
+        return;
+      }
+      if (buildMenuWasOpen && pointer.leftButtonDown()) {
+        this.buildTile = undefined;
+        return;
+      }
       if (this.pendingAction && room) {
         const x = Math.floor(point.x / 32),
           y = Math.floor(point.y / 32);
-        if (
-          this.pendingAction === "fortress" ||
-          this.pendingAction === "factory" ||
-          this.pendingAction === "relay" ||
-          this.pendingAction === "wall" ||
-          this.pendingAction === "turret"
-        )
-          room.send("build", { kind: this.pendingAction, x, y });
-        else {
-          room.send("order", {
-            unitIds: [...this.selected].flatMap((id) => {
-              const serverId = this.unitServerIds.get(id);
-              return serverId ? [serverId] : [];
-            }),
-            mode: this.pendingAction,
-            x: x + 0.5,
-            y: y + 0.5,
-          });
-          this.showOrderZone(point.x, point.y, this.pendingAction);
-        }
+        room.send("order", {
+          unitIds: [...this.selected].flatMap((id) => {
+            const serverId = this.unitServerIds.get(id);
+            return serverId ? [serverId] : [];
+          }),
+          mode: this.pendingAction,
+          x: x + 0.5,
+          y: y + 0.5,
+        });
+        this.showOrderZone(point.x, point.y, this.pendingAction);
         this.pendingAction = null;
         $("#mode").textContent = "";
         return;
@@ -259,6 +450,12 @@ class Dominion extends Phaser.Scene {
     this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
       if (!this.selectionStart) return;
       const point = this.cameras.main.getWorldPoint(pointer.x, pointer.y),
+        wasClick = Phaser.Math.Distance.Between(
+          this.selectionStart.x,
+          this.selectionStart.y,
+          point.x,
+          point.y,
+        ) < 8,
         minX = Math.min(this.selectionStart.x, point.x),
         maxX = Math.max(this.selectionStart.x, point.x),
         minY = Math.min(this.selectionStart.y, point.y),
@@ -279,7 +476,29 @@ class Dominion extends Phaser.Scene {
       this.selectionStart = undefined;
       this.selectionBox?.destroy();
       this.selectionBox = undefined;
+      if (wasClick) this.openBuildMenu(pointer.x, pointer.y, point.x, point.y);
     });
+  }
+  openBuildMenu(screenX: number, screenY: number, worldX: number, worldY: number) {
+    const x = Math.floor(worldX / 32),
+      y = Math.floor(worldY / 32),
+      key = `${x},${y}`;
+    if (this.tileOwners.get(key) !== myId || this.obstacles.has(key)) {
+      this.buildTile = undefined;
+      $("#buildMenu").hidden = true;
+      return;
+    }
+    this.buildTile = { x, y };
+    const menu = $("#buildMenu");
+    menu.style.left = `${screenX}px`;
+    menu.style.top = `${screenY}px`;
+    menu.hidden = false;
+  }
+  buildAtSelectedTile(kind: "fortress" | "factory" | "relay") {
+    if (!room || !this.buildTile) return;
+    room.send("build", { kind, ...this.buildTile });
+    this.buildTile = undefined;
+    $("#buildMenu").hidden = true;
   }
   createUnitBatches() {
     const definitions: Array<[UnitView["kind"], number]> = [
@@ -353,6 +572,7 @@ class Dominion extends Phaser.Scene {
             ? (owners.get(ownerId) ?? 0x465565)
             : 0x10263a,
         visualState = color * 16 + supplyDecay;
+      this.tileOwners.set(key, ownerId);
       if (this.tileColors.get(key) === visualState) continue;
       this.tileColors.set(key, visualState);
       const chunkX = Math.floor(x / chunkSize),
@@ -436,6 +656,9 @@ class Dominion extends Phaser.Scene {
     for (const tileKey of this.tileColors.keys())
       if (!retainedChunks.has(chunkForTile(tileKey)))
         this.tileColors.delete(tileKey);
+    for (const tileKey of this.tileOwners.keys())
+      if (!retainedChunks.has(chunkForTile(tileKey)))
+        this.tileOwners.delete(tileKey);
     for (const tileKey of this.obstacles)
       if (!retainedChunks.has(chunkForTile(tileKey)))
         this.obstacles.delete(tileKey);
@@ -528,10 +751,23 @@ class Dominion extends Phaser.Scene {
         overlay.fillStyle(0x101a2b, 0.95).fillRect(target.x - 15, target.y - 28, 30, 5);
         overlay.fillStyle(0xffd166, 1).fillRect(target.x - 14, target.y - 29.5, 28 * progress, 3);
       }
-      if (state.kind === "bastion" && state.bastionType === "relay")
-        overlay
-          .lineStyle(2, 0x39e6d0, 0.9)
-          .strokeCircle(target.x, target.y, state.size / 2 + 4);
+      if (state.kind === "bastion" && state.bastionType === "relay") {
+        if (state.ownerId === myId)
+          overlay
+            .lineStyle(1, 0x39e6d0, 0.16)
+            .strokeCircle(target.x, target.y, GAME.supply.relayRadius * 32);
+        overlay.lineStyle(2, 0x39e6d0, 0.95);
+        overlay.strokeCircle(target.x, target.y, state.size / 2 + 5);
+        overlay.strokeCircle(target.x, target.y, state.size / 2 + 10);
+        overlay.beginPath();
+        overlay.moveTo(target.x, target.y - 9);
+        overlay.lineTo(target.x + 9, target.y);
+        overlay.lineTo(target.x, target.y + 9);
+        overlay.lineTo(target.x - 9, target.y);
+        overlay.closePath();
+        overlay.strokePath();
+        overlay.fillStyle(0xffffff, 1).fillCircle(target.x, target.y, 3);
+      }
       else if (state.kind === "bastion" && state.bastionType === "fortress") {
         overlay.lineStyle(2, 0xffffff, 0.85);
         overlay.lineBetween(target.x - 6, target.y, target.x + 6, target.y);
@@ -908,18 +1144,13 @@ document
       room?.send("buy", { item: (b as HTMLElement).dataset.buy }),
     ),
   );
-document.querySelectorAll("[data-build]").forEach((button) =>
+document.querySelectorAll("[data-tile-build]").forEach((button) =>
   button.addEventListener("click", () => {
-    if (!sceneRef) return;
-    const kind = (button as HTMLElement).dataset.build as
+    const kind = (button as HTMLElement).dataset.tileBuild as
       | "fortress"
       | "factory"
-      | "relay"
-      | "wall"
-      | "turret";
-    sceneRef.pendingAction = kind;
-    $("#mode").textContent =
-      `Clique sur une tuile alliée pour placer ${kind === "fortress" ? "la forteresse" : kind === "factory" ? "l’usine" : kind === "relay" ? "le relais" : kind === "wall" ? "le mur" : "la tourelle"}`;
+      | "relay";
+    sceneRef?.buildAtSelectedTile(kind);
   }),
 );
 document.querySelectorAll("[data-order]").forEach((button) =>
@@ -948,6 +1179,9 @@ document.querySelectorAll("[data-order]").forEach((button) =>
 );
 $("#login").onclick = () => void authenticate("login");
 $("#register").onclick = () => void authenticate("register");
+const countryInput = document.querySelector("#country") as HTMLInputElement;
+const localeCountry = navigator.language.split("-")[1]?.toUpperCase();
+countryInput.value = /^[A-Z]{2}$/.test(localeCountry ?? "") ? localeCountry! : "FR";
 if (account && authToken) setAccount(account, authToken);
 void loadGlobalLeaderboard();
 
@@ -962,6 +1196,10 @@ $("#play").onclick = async () => {
       ...(authToken ? { token: authToken } : {}),
     });
     myId = room.sessionId;
+    room.onMessage("welcome", (payload: { roomId: string; matchId: string }) => {
+      errorContext.roomId = payload.roomId;
+      errorContext.matchId = payload.matchId;
+    });
     room.onMessage("unitIds", (payload: Uint8Array | Array<[number, string]>) => {
       const mappings = payload instanceof Uint8Array
         ? decode(payload) as Array<[number, string]>
@@ -1042,12 +1280,14 @@ $("#play").onclick = async () => {
       showNotice(r.message, r.ok),
     );
     room.onMessage("account", (updated: Account) => setAccount(updated, authToken));
-    room.onMessage("matchResult", (result: { points: number; score: number }) => {
+    room.onMessage("matchResult", (result: MatchResult) => {
       if (account) setAccount({ ...account, score: result.score }, authToken);
-      showNotice(`Partie terminée : +${result.points} points`, true);
+      showMatchEnd(result);
       void loadGlobalLeaderboard();
     });
-    room.onMessage("newMatch", () => {
+    room.onMessage("newMatch", (payload: { roomId: string; matchId: string }) => {
+      errorContext.roomId = payload.roomId;
+      errorContext.matchId = payload.matchId;
       clientUnits.clear();
       rustIds.clear();
       pendingRustUnitDelta = { created: [], updated: [], removed: [] };
@@ -1062,12 +1302,35 @@ $("#play").onclick = async () => {
       $("#connection").style.color = "#ff5263";
     });
     $("#menu").style.display = "none";
+    menuBattle.stop();
     $("#hud").hidden = false;
   } catch (e) {
     console.error(e);
     $("#play").textContent = "CONNEXION REFUSÉE — SE RECONNECTER";
   }
 };
+
+async function returnToMenu(focusMode = false) {
+  $("#matchEnd").hidden = true;
+  $("#hud").hidden = true;
+  if (room) {
+    const leaving = room;
+    room = null;
+    await leaving.leave(true).catch(() => {});
+  }
+  $("#menu").style.display = "grid";
+  menuBattle.start();
+  setAccount(account, authToken);
+  if (focusMode) $("#modeChooser").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+$("#replayMatch").onclick = () => {
+  $("#matchEnd").hidden = true;
+  showNotice("Nouvelle conquête lancée", true);
+};
+$("#changeMode").onclick = () => void returnToMenu(true);
+$("#quitMatch").onclick = () => void returnToMenu(false);
+
 function showNotice(message: string, ok: boolean) {
   let n = document.querySelector("#notice") as HTMLElement | null;
   if (!n) {

@@ -7,18 +7,10 @@ export const InputSchema = z.object({
   attack: z.boolean().optional(),
 });
 export const BuySchema = z.object({
-  item: z.enum([
-    "robot",
-    "soldier",
-    "attacker",
-    "defender",
-    "speed",
-    "armor",
-    "capture",
-  ]),
+  item: z.enum(["robot", "soldier", "attacker", "defender"]),
 });
 export const BuildSchema = z.object({
-  kind: z.enum(["fortress", "factory", "relay", "wall", "turret"]),
+  kind: z.enum(["fortress", "factory", "relay"]),
   x: z.number().int().nonnegative(),
   y: z.number().int().nonnegative(),
 });

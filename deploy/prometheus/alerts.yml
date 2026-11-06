@@ -1,0 +1,54 @@
+groups:
+  - name: tile-dominion
+    rules:
+      - alert: TileDominionServerDown
+        expr: up{job="tile-dominion"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "Tile Dominion ne répond plus"
+          description: "Prometheus ne peut plus joindre le serveur depuis 30 secondes."
+
+      - alert: RustProcessCrash
+        expr: increase(tile_rust_process_crashes_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Un moteur Rust a quitté de façon inattendue"
+          description: "Au moins un processus Rust a planté pendant les 5 dernières minutes."
+
+      - alert: RustTimeouts
+        expr: increase(tile_rust_timeouts_total[5m]) > 2
+        labels: { severity: warning }
+        annotations:
+          summary: "Délais Rust répétés"
+          description: "Plus de deux requêtes IPC Rust ont expiré en cinq minutes."
+
+      - alert: TickLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(tile_tick_duration_seconds_bucket[5m]))) > 0.05
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Le tick serveur dépasse son budget"
+          description: "Le p95 des ticks dépasse 50 ms depuis deux minutes."
+
+      - alert: TickOverrunsBurst
+        expr: increase(tile_tick_overruns_total[5m]) > 20
+        labels: { severity: warning }
+        annotations:
+          summary: "Rafale de dépassements de tick"
+          description: "Plus de 20 ticks ont dépassé leur budget en cinq minutes."
+
+      - alert: ServerMemoryHigh
+        expr: tile_process_process_resident_memory_bytes > 1.5e9
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Mémoire serveur élevée"
+          description: "Le processus Node dépasse 1,5 Go de mémoire résidente."
+
+      - alert: ClientErrorsBurst
+        expr: increase(tile_client_errors_total[10m]) > 20
+        labels: { severity: warning }
+        annotations:
+          summary: "Rafale d’erreurs navigateur"
+          description: "Plus de 20 erreurs client ont été reçues en dix minutes."

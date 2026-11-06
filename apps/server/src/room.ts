@@ -18,6 +18,14 @@ import { World } from "./world.js";
 import { RustEngine } from "./rust-engine.js";
 import { key, type Player, type Unit } from "./model.js";
 import { accounts, type PublicAccount } from "./accounts.js";
+import { logger } from "./logger.js";
+import {
+  playersGauge,
+  roomsGauge,
+  tickDuration,
+  tickOverruns,
+  websocketGauge,
+} from "./telemetry.js";
 
 type BotForces = {
   robots: Unit[];
@@ -41,10 +49,30 @@ type MinimapWire = [
   Array<[number, string | null]>,
 ];
 
+type MatchStats = {
+  maxTerritory: number;
+  tilesCaptured: number;
+  tilesLost: number;
+  unitsProduced: number;
+  buildingsProduced: number;
+  territoryHistory: Array<[number, number]>;
+  lastHistoryAt: number;
+};
+
+const emptyMatchStats = (tiles: number, now: number): MatchStats => ({
+  maxTerritory: tiles,
+  tilesCaptured: 0,
+  tilesLost: 0,
+  unitsProduced: 0,
+  buildingsProduced: 0,
+  territoryHistory: [[0, tiles]],
+  lastHistoryAt: now,
+});
+
 export class DominionRoom extends Room {
   maxClients = GAME.room.maxPlayers;
   world = new World();
-  rust = new RustEngine();
+  rust = new RustEngine(() => this.logContext());
   simulationBusy = false;
   elapsed = 0;
   rates = new Map<string, { at: number; n: number }>();
@@ -67,8 +95,13 @@ export class DominionRoom extends Room {
   readonly playerAccounts = new Map<string, PublicAccount>();
   matchFinished = false;
   matchFinishing = false;
+  matchStats = new Map<string, MatchStats>();
   minimapOwners: Array<string | null> = [];
+  connectedSessions = new Set<string>();
+  lastTickWarning = 0;
   onCreate() {
+    roomsGauge.inc();
+    logger.info("room_created", this.logContext());
     for (let i = 0; i < GAME.bots.count; i++) this.addBot();
     this.setSimulationInterval(
       (dt) => void this.step(dt / 1000),
@@ -93,13 +126,7 @@ export class DominionRoom extends Room {
         ok = this.world.buy(c.sessionId, item),
         counts = this.world.counts(c.sessionId);
       let message = ok ? "Achat confirmé" : "Achat refusé";
-      if (
-        !ok &&
-        (item === "robot" ||
-          item === "soldier" ||
-          item === "attacker" ||
-          item === "defender")
-      ) {
+      if (!ok) {
         const cfg = GAME.units[item];
         message =
           counts[item === "robot" ? "robots" : "soldiers"] >= cfg.max
@@ -107,11 +134,6 @@ export class DominionRoom extends Room {
             : before < cfg.price
               ? `Il faut ${cfg.price} crédits`
               : message;
-      } else if (!ok && p) {
-        const cfg = GAME.upgrades[item as keyof typeof GAME.upgrades],
-          level = p.upgrades[item as keyof typeof p.upgrades];
-        message =
-          level >= cfg.max ? "Niveau maximum atteint" : "Fonds insuffisants";
       }
       c.send("purchase", {
         ok,
@@ -125,12 +147,7 @@ export class DominionRoom extends Room {
       if (!this.allow(c)) return;
       const v = BuildSchema.safeParse(m);
       if (!v.success) return;
-      const buildPrice =
-          v.data.kind === "wall"
-            ? GAME.units.bastion.wallPrice
-            : v.data.kind === "turret"
-              ? GAME.units.bastion.turretPrice
-              : GAME.units.bastion.price,
+      const buildPrice = GAME.units.bastion.price,
         ok = this.world.placeBastion(
           c.sessionId,
           v.data.x,
@@ -144,7 +161,7 @@ export class DominionRoom extends Room {
         item: v.data.kind,
         money: p?.money ?? 0,
         message: ok
-          ? `${v.data.kind === "fortress" ? "Forteresse" : v.data.kind === "factory" ? "Usine" : v.data.kind === "relay" ? "Relais" : v.data.kind === "wall" ? "Mur" : "Tourelle"} construit`
+          ? `${v.data.kind === "fortress" ? "Forteresse" : v.data.kind === "factory" ? "Usine" : "Relais"} construit`
           : `Placement impossible (territoire, distance ou ${buildPrice} crédits)`,
         ...counts,
       });
@@ -181,17 +198,29 @@ export class DominionRoom extends Room {
       account?.username ?? (v.success ? v.data.name : `Invité-${c.sessionId.slice(0, 4)}`),
       COLORS[this.clients.length % COLORS.length],
     );
+    this.matchStats.set(
+      c.sessionId,
+      emptyMatchStats(this.world.territoryCounts.get(c.sessionId) ?? 0, Date.now()),
+    );
     if (account) {
       this.playerAccounts.set(c.sessionId, account);
       c.send("account", account);
     }
+    this.connectedSessions.add(c.sessionId);
+    playersGauge.inc();
+    websocketGauge.inc();
+    logger.info("player_joined", {
+      ...this.logContext(), sessionId: c.sessionId, authenticated: !!account,
+      connections: this.connectedSessions.size,
+    });
     this.rust.invalidateMap();
-    c.send("welcome", { id: c.sessionId });
+    c.send("welcome", { id: c.sessionId, roomId: this.roomId, matchId: this.matchId });
   }
   async onLeave(c: Client, consented: boolean) {
     if (consented) {
       this.replaceHumanWithBot(c.sessionId);
       this.cleanupClient(c.sessionId);
+      this.recordDisconnect(c.sessionId, "consented");
       return;
     }
     try {
@@ -199,10 +228,18 @@ export class DominionRoom extends Room {
     } catch {
       this.replaceHumanWithBot(c.sessionId);
       this.cleanupClient(c.sessionId);
+      this.recordDisconnect(c.sessionId, "reconnect_timeout");
     }
   }
   onDispose() {
     this.rust.close();
+    if (this.connectedSessions.size) {
+      playersGauge.dec(this.connectedSessions.size);
+      websocketGauge.dec(this.connectedSessions.size);
+      this.connectedSessions.clear();
+    }
+    roomsGauge.dec();
+    logger.info("room_disposed", this.logContext());
   }
   allow(c: Client) {
     const now = Date.now(),
@@ -218,12 +255,13 @@ export class DominionRoom extends Room {
   async step(dt: number) {
     if (this.simulationBusy) return;
     this.simulationBusy = true;
+    const tickStartedAt = performance.now();
     const now = Date.now();
     if (now >= this.world.endsAt) {
       try {
         await this.finishMatch();
       } catch (error) {
-        console.error("Échec de l’attribution des scores de fin de partie", error);
+        logger.error("match_score_award_failed", { ...this.logContext(), error });
       }
     }
     try {
@@ -240,6 +278,7 @@ export class DominionRoom extends Room {
         return [x, y, this.fullNetworkCells.has(cell) || entrant] as [number, number, boolean];
       }));
       await this.world.tickWithRust(this.rust, Math.min(dt, 0.1), now, false);
+      this.collectMatchStats(now);
       this.elapsed += dt;
       if (this.elapsed >= 0.1) {
         this.elapsed = 0;
@@ -250,12 +289,24 @@ export class DominionRoom extends Room {
         this.world.dirtyTiles.clear();
       }
     } catch (error) {
-      console.error(
-        "Moteur Rust indisponible, tick TypeScript de secours",
-        error,
-      );
+      logger.error("rust_tick_fallback", { ...this.logContext(), error });
       this.world.tick(Math.min(dt, 0.1), now);
     } finally {
+      const durationSeconds = (performance.now() - tickStartedAt) / 1000;
+      tickDuration.observe(durationSeconds);
+      const budgetSeconds = 1 / GAME.room.tickRate;
+      if (durationSeconds > budgetSeconds) {
+        tickOverruns.inc();
+        if (now - this.lastTickWarning >= 5_000) {
+          this.lastTickWarning = now;
+          logger.warn("tick_budget_exceeded", {
+            ...this.logContext(), durationMs: durationSeconds * 1000,
+            budgetMs: budgetSeconds * 1000,
+            units: this.world.units.size,
+            players: this.connectedSessions.size,
+          });
+        }
+      }
       this.simulationBusy = false;
     }
   }
@@ -267,19 +318,78 @@ export class DominionRoom extends Room {
         (total, tile) => total + (tile.obstacle ? 0 : 1),
         0,
       );
-      const results = await Promise.all(
-        [...this.playerAccounts].map(async ([sessionId, account]) => {
-          const tiles = this.world.territoryCounts.get(sessionId) ?? 0;
-          const points = scoreForTerritory(tiles, capturableTiles);
-          const updated = await accounts.awardScore(account.id, this.matchId, points);
-          return { sessionId, points, score: updated?.score ?? account.score };
-        }),
-      );
+      this.collectMatchStats(Date.now(), true);
+      const standings = [...this.world.players.values()]
+        .map((player) => ({
+          id: player.id,
+          name: player.name,
+          tiles: this.world.territoryCounts.get(player.id) ?? 0,
+          kills: player.kills,
+          isBot: player.isBot,
+        }))
+        .sort((a, b) => b.tiles - a.tiles || b.kills - a.kills || a.name.localeCompare(b.name));
+      const beforeRanks = new Map<string, Awaited<ReturnType<typeof accounts.ranking>>>();
+      await Promise.all([...this.playerAccounts].map(async ([sessionId, account]) => {
+        beforeRanks.set(sessionId, await accounts.ranking(account.id));
+      }));
+      const awarded = new Map<string, PublicAccount>();
+      await Promise.all([...this.playerAccounts].map(async ([sessionId, account]) => {
+        const tiles = this.world.territoryCounts.get(sessionId) ?? 0;
+        const stats = this.matchStats.get(sessionId) ?? emptyMatchStats(tiles, Date.now());
+        const updated = await accounts.awardScore(
+          account.id,
+          this.matchId,
+          scoreForTerritory(tiles, capturableTiles),
+          stats.maxTerritory,
+        );
+        if (updated) awarded.set(sessionId, updated);
+      }));
+      const afterRanks = new Map<string, Awaited<ReturnType<typeof accounts.ranking>>>();
+      await Promise.all([...this.playerAccounts].map(async ([sessionId, account]) => {
+        afterRanks.set(sessionId, await accounts.ranking(account.id));
+      }));
       this.matchFinished = true;
-      for (const result of results)
-        this.clients
-          .find(({ sessionId }) => sessionId === result.sessionId)
-          ?.send("matchResult", { points: result.points, score: result.score });
+      logger.info("match_finished", {
+        ...this.logContext(), authenticatedPlayers: awarded.size,
+      });
+      for (const client of this.clients) {
+        const sessionId = client.sessionId;
+        const account = this.playerAccounts.get(sessionId);
+        const updated = awarded.get(sessionId);
+        const stats = this.matchStats.get(sessionId) ?? emptyMatchStats(0, Date.now());
+        const player = this.world.players.get(sessionId);
+        const placement = Math.max(1, standings.findIndex(({ id }) => id === sessionId) + 1);
+        const tiles = this.world.territoryCounts.get(sessionId) ?? 0;
+        const before = beforeRanks.get(sessionId);
+        const after = afterRanks.get(sessionId);
+        client.send("matchResult", {
+          points: account ? scoreForTerritory(tiles, capturableTiles) : 0,
+          score: updated?.score ?? account?.score ?? 0,
+          authenticated: !!account,
+          country: updated?.country ?? account?.country ?? "XX",
+          placement,
+          totalPlayers: standings.length,
+          winner: standings[0]?.name ?? "—",
+          standings: standings.slice(0, 10),
+          rankings: account ? {
+            world: rankChange(before?.world, after?.world),
+            country: rankChange(before?.country, after?.country),
+          } : null,
+          stats: {
+            maxTerritory: stats.maxTerritory,
+            tilesCaptured: stats.tilesCaptured,
+            tilesLost: stats.tilesLost,
+            kills: player?.kills ?? 0,
+            unitsProduced: stats.unitsProduced,
+            buildingsProduced: stats.buildingsProduced,
+            territoryHistory: stats.territoryHistory,
+          },
+          personalBest: {
+            value: updated?.bestTerritory ?? stats.maxTerritory,
+            isNew: !!account && stats.maxTerritory > account.bestTerritory,
+          },
+        });
+      }
       this.startNextMatch();
     } finally {
       this.matchFinishing = false;
@@ -296,9 +406,10 @@ export class DominionRoom extends Room {
 
     this.rust.close();
     this.world = new World();
-    this.rust = new RustEngine();
+    this.rust = new RustEngine(() => this.logContext());
     this.matchId = randomUUID();
     this.matchFinished = false;
+    this.matchStats.clear();
     this.elapsed = 0;
     this.botThink.clear();
     this.botBuildThink.clear();
@@ -318,10 +429,67 @@ export class DominionRoom extends Room {
         human.name,
         COLORS[(index + 1) % COLORS.length],
       );
+      this.matchStats.set(
+        human.sessionId,
+        emptyMatchStats(this.world.territoryCounts.get(human.sessionId) ?? 0, Date.now()),
+      );
       this.fullNetworkCells.add(this.interestCellFor(human.sessionId));
     }
     this.rust.invalidateMap();
-    this.broadcast("newMatch", { endsAt: this.world.endsAt });
+    logger.info("match_started", this.logContext());
+    this.broadcast("newMatch", {
+      endsAt: this.world.endsAt,
+      roomId: this.roomId,
+      matchId: this.matchId,
+    });
+  }
+
+  private logContext() {
+    return { roomId: this.roomId, matchId: this.matchId };
+  }
+
+  private collectMatchStats(now: number, forceHistory = false) {
+    const events = this.world.drainMatchEvents();
+    for (const event of events.ownership) {
+      if (event.owner) {
+        const stats = this.matchStats.get(event.owner);
+        if (stats) stats.tilesCaptured++;
+      }
+      if (event.previousOwner) {
+        const stats = this.matchStats.get(event.previousOwner);
+        if (stats) stats.tilesLost++;
+      }
+    }
+    for (const event of events.creations) {
+      const stats = this.matchStats.get(event.ownerId);
+      if (!stats) continue;
+      if (event.kind === "building") stats.buildingsProduced++;
+      else stats.unitsProduced++;
+    }
+    const elapsedSeconds = Math.max(
+      0,
+      Math.round((now - (this.world.endsAt - GAME.room.durationMs)) / 1000),
+    );
+    for (const [sessionId, stats] of this.matchStats) {
+      const tiles = this.world.territoryCounts.get(sessionId) ?? 0;
+      stats.maxTerritory = Math.max(stats.maxTerritory, tiles);
+      if (forceHistory || now - stats.lastHistoryAt >= 10_000) {
+        const previous = stats.territoryHistory.at(-1);
+        if (!previous || previous[0] !== elapsedSeconds)
+          stats.territoryHistory.push([elapsedSeconds, tiles]);
+        stats.lastHistoryAt = now;
+      }
+    }
+  }
+
+  private recordDisconnect(sessionId: string, reason: string) {
+    if (!this.connectedSessions.delete(sessionId)) return;
+    playersGauge.dec();
+    websocketGauge.dec();
+    logger.info("player_left", {
+      ...this.logContext(), sessionId, reason,
+      connections: this.connectedSessions.size,
+    });
   }
   updateBots(now: number) {
     const due = [...this.world.players.values()].filter(
@@ -513,13 +681,11 @@ export class DominionRoom extends Room {
     threatened: boolean,
     now: number,
   ) {
-    if (p.money < GAME.units.bastion.wallPrice) return;
+    if (p.money < GAME.units.bastion.price) return;
     const tiles = this.world.territoryCounts.get(p.id) ?? 0,
       relayGoal = Math.min(6, Math.max(1, Math.ceil(tiles / 100))),
       fortressGoal = Math.max(1, Math.ceil(tiles / 80)),
       factoryGoal = Math.max(1, Math.ceil(tiles / 120)),
-      turretGoal = Math.max(1, Math.ceil(tiles / 100)),
-      wallGoal = threatened ? Math.min(6, 2 + Math.floor(tiles / 80)) : 0,
       candidates = this.botBuildCandidates(p);
     if (!candidates.length) return;
     const unsupplied = candidates.find(
@@ -543,27 +709,9 @@ export class DominionRoom extends Room {
         [0, -1],
       ].some(([dx, dy]) => this.world.map.get(key(x + dx, y + dy))?.owner !== p.id),
     );
-    if (
-      threatened &&
-      army.turrets.length < turretGoal &&
-      p.money >= GAME.units.bastion.turretPrice
-    ) {
-      const site = frontier ?? candidates[0];
-      this.world.placeBastion(p.id, site.x, site.y, "turret", now);
-      return;
-    }
     if ((threatened || frontier) && army.fortresses.length < fortressGoal) {
       const site = frontier ?? candidates[0];
       this.world.placeBastion(p.id, site.x, site.y, "fortress", now);
-      return;
-    }
-    if (
-      threatened &&
-      army.walls.length < wallGoal &&
-      p.money >= GAME.units.bastion.wallPrice
-    ) {
-      const site = frontier ?? candidates[0];
-      this.world.placeBastion(p.id, site.x, site.y, "wall", now);
       return;
     }
     if (army.factories.length < factoryGoal) {
@@ -1026,4 +1174,9 @@ export class DominionRoom extends Room {
 export function scoreForTerritory(ownedTiles: number, capturableTiles: number) {
   if (capturableTiles <= 0) return 0;
   return Math.max(0, Math.min(1000, Math.round((ownedTiles / capturableTiles) * 1000)));
+}
+
+function rankChange(before?: number | null, after?: number | null) {
+  if (before == null || after == null) return null;
+  return { before, after, gained: before - after };
 }

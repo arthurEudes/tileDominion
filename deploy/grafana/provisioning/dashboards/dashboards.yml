@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: Tile Dominion
+    folder: Tile Dominion
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

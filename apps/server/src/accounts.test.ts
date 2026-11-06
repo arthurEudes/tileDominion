@@ -32,6 +32,24 @@ describe("accounts and global score", () => {
     ]);
   });
 
+  it("tracks country/world ranking and the personal territory record", async () => {
+    const service = new AccountService(new MemoryAccountStore());
+    const alpha = await service.register("AlphaFR", "mot-de-passe-a", "FR");
+    const bravo = await service.register("BravoFR", "mot-de-passe-b", "fr");
+    const charlie = await service.register("CharlieBE", "mot-de-passe-c", "BE");
+
+    await service.awardScore(alpha.account.id, "11111111-1111-4111-8111-111111111111", 200, 340);
+    await service.awardScore(bravo.account.id, "22222222-2222-4222-8222-222222222222", 300, 280);
+    await service.awardScore(charlie.account.id, "33333333-3333-4333-8333-333333333333", 250, 410);
+
+    expect(await service.ranking(alpha.account.id)).toEqual({ world: 3, country: 2 });
+    expect((await service.leaderboard())[2]).toMatchObject({
+      username: "AlphaFR",
+      country: "FR",
+      bestTerritory: 340,
+    });
+  });
+
   it("converts captured territory to a 0–1000 score", () => {
     expect(scoreForTerritory(0, 400)).toBe(0);
     expect(scoreForTerritory(100, 400)).toBe(250);

@@ -1,5 +1,6 @@
 {
   "name": "@tile/server",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -22,6 +23,7 @@
     "dotenv": "latest",
     "express": "latest",
     "pg": "^8.23.1",
+    "prom-client": "^15.1.3",
     "zod": "latest"
   },
   "devDependencies": {

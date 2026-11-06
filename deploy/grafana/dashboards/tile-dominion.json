@@ -1,0 +1,21 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"type":"stat","title":"Salles","datasource":{"uid":"prometheus"},"targets":[{"expr":"tile_rooms_active"}],"gridPos":{"h":4,"w":4,"x":0,"y":0}},
+    {"type":"stat","title":"Joueurs connectés","datasource":{"uid":"prometheus"},"targets":[{"expr":"tile_players_connected"}],"gridPos":{"h":4,"w":4,"x":4,"y":0}},
+    {"type":"stat","title":"WebSockets","datasource":{"uid":"prometheus"},"targets":[{"expr":"tile_websocket_connections"}],"gridPos":{"h":4,"w":4,"x":8,"y":0}},
+    {"type":"stat","title":"Moteurs Rust","datasource":{"uid":"prometheus"},"targets":[{"expr":"tile_rust_engines_active"}],"gridPos":{"h":4,"w":4,"x":12,"y":0}},
+    {"type":"timeseries","title":"Ticks p50 / p95 / p99","datasource":{"uid":"prometheus"},"targets":[{"expr":"histogram_quantile(0.50, sum by (le) (rate(tile_tick_duration_seconds_bucket[5m])))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95, sum by (le) (rate(tile_tick_duration_seconds_bucket[5m])))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99, sum by (le) (rate(tile_tick_duration_seconds_bucket[5m])))","legendFormat":"p99"}],"gridPos":{"h":8,"w":12,"x":0,"y":4}},
+    {"type":"timeseries","title":"IPC Rust","datasource":{"uid":"prometheus"},"targets":[{"expr":"histogram_quantile(0.95, sum by (le) (rate(tile_rust_roundtrip_seconds_bucket[5m])))","legendFormat":"p95"},{"expr":"rate(tile_rust_timeouts_total[5m])","legendFormat":"timeouts/s"}],"gridPos":{"h":8,"w":12,"x":12,"y":4}},
+    {"type":"timeseries","title":"CPU et mémoire","datasource":{"uid":"prometheus"},"targets":[{"expr":"rate(tile_process_process_cpu_seconds_total[5m])","legendFormat":"CPU cores"},{"expr":"tile_process_process_resident_memory_bytes / 1024 / 1024","legendFormat":"RAM MiB"}],"gridPos":{"h":8,"w":12,"x":0,"y":12}},
+    {"type":"logs","title":"Logs serveur","datasource":{"uid":"loki"},"targets":[{"expr":"{service=\"server\"}"}],"gridPos":{"h":8,"w":12,"x":12,"y":12}}
+  ],
+  "schemaVersion": 39,
+  "tags": ["tile-dominion"],
+  "templating": {"list": []},
+  "time": {"from":"now-1h","to":"now"},
+  "title": "Tile Dominion — Production",
+  "uid": "tile-dominion-production",
+  "version": 1
+}

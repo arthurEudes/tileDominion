@@ -10,7 +10,7 @@ export const GAME = {
   },
   room: {
     maxPlayers: 50,
-    durationMs: 10 * 60_000,
+    durationMs: 15 * 60_000,
     reconnectSeconds: 20,
     tickRate: 20,
   },
@@ -25,16 +25,16 @@ export const GAME = {
     intermediateRadius: 36,
   },
   player: {
-    speed: 5.2,
-    maxHp: 100,
+    speed: 6.448,
+    maxHp: 160,
     attackDamage: 22,
     attackRange: 1.8,
     attackCooldownMs: 650,
     respawnInvulnerabilityMs: 2500,
   },
   capture: {
-    holdMs: 550,
-    improvedMultiplier: 0.88,
+    holdMs: 375,
+    improvedMultiplier: 1,
     enemyMultiplier: 3,
     robotMultiplier: 2,
   },
@@ -113,11 +113,8 @@ export const GAME = {
       turretCooldownMs: 700,
     },
   },
-  upgrades: {
-    speed: { basePrice: 110, max: 3, bonus: 0.08 },
-    armor: { basePrice: 110, max: 3, hp: 20 },
-    capture: { basePrice: 120, max: 3 },
-  },
+  // Conservé sur le fil Rust tant que l'ancien format IPC est décodable.
+  upgrades: { speed: { bonus: 0 } },
 } as const;
 
 export function incomeForTerritory(effectiveTiles: number) {

@@ -47,6 +47,14 @@ export class World {
   readonly suppliedTiles = new Uint8Array(GAME.map.width * GAME.map.height);
   readonly wallTiles = new Set<string>();
   readonly supplyAnchors = new Map<string, { x: number; y: number }>();
+  readonly ownershipEvents: Array<{
+    previousOwner: string | null;
+    owner: string | null;
+  }> = [];
+  readonly creationEvents: Array<{
+    ownerId: string;
+    kind: "unit" | "building";
+  }> = [];
   endsAt = Date.now() + GAME.room.durationMs;
   private serial = 0;
   private incomeElapsed = 0;
@@ -92,7 +100,7 @@ export class World {
           t = this.map.get(k);
         if (t) {
           t.obstacle = false;
-          this.setOwner(k, t, id);
+          this.setOwner(k, t, id, false);
         }
       }
     return p;
@@ -179,25 +187,10 @@ export class World {
   buy(id: string, item: BuyItem) {
     const p = this.players.get(id);
     if (!p || !p.alive) return false;
-    const level =
-      item === "speed" || item === "armor" || item === "capture"
-        ? p.upgrades[item]
-        : 0;
-    const isUnitPurchase =
-        item === "robot" ||
-        item === "soldier" ||
-        item === "attacker" ||
-        item === "defender",
-      cfg: any = isUnitPurchase
-        ? GAME.units[item]
-        : (GAME.upgrades as any)[item];
-    const price = cfg.price ?? cfg.basePrice * (level + 1);
-    if (p.money < price) return false;
-    if (isUnitPurchase) {
-      const count = this.unitCount(id, item);
-      if (count >= cfg.max) return false;
-      const unitId = `u${++this.serial}`;
-      this.units.set(unitId, {
+    const cfg = GAME.units[item];
+    if (p.money < cfg.price || this.unitCount(id, item) >= cfg.max) return false;
+    const unitId = `u${++this.serial}`;
+    this.units.set(unitId, {
         id: unitId,
         ownerId: id,
         kind: item,
@@ -220,18 +213,11 @@ export class World {
         cachedTargetUntil: 0,
         homeX: item === "defender" ? p.x : undefined,
         homeY: item === "defender" ? p.y : undefined,
-      });
-      this.adjustUnitCount(id, item, 1);
-      this.markUnit(unitId);
-    } else {
-      if (level >= cfg.max) return false;
-      p.upgrades[item]++;
-      if (item === "armor") {
-        p.maxHp += cfg.hp;
-        p.hp += cfg.hp;
-      }
-    }
-    p.money -= price;
+    });
+    this.adjustUnitCount(id, item, 1);
+    this.markUnit(unitId);
+    p.money -= cfg.price;
+    this.creationEvents.push({ ownerId: id, kind: "unit" });
     return true;
   }
   placeBastion(
@@ -244,19 +230,14 @@ export class World {
     const p = this.players.get(id),
       cfg = GAME.units.bastion,
       tileKey = key(x, y),
-      t = this.map.get(tileKey),
-      price =
-        bastionType === "wall"
-          ? cfg.wallPrice
-          : bastionType === "turret"
-            ? cfg.turretPrice
-            : cfg.price,
-      hp =
-        bastionType === "wall"
-          ? cfg.wallHp
-          : bastionType === "turret"
-            ? cfg.turretHp
-            : cfg.hp;
+      t = this.map.get(tileKey);
+    if (
+      bastionType !== "fortress" &&
+      bastionType !== "factory" &&
+      bastionType !== "relay"
+    ) return false;
+    const price = cfg.price,
+      hp = cfg.hp;
     if (
       !p ||
       !p.alive ||
@@ -270,16 +251,7 @@ export class World {
           u.kind === "bastion" &&
           Math.floor(u.x) === x &&
           Math.floor(u.y) === y,
-      ) ||
-      (bastionType === "wall" &&
-        ([...this.players.values()].some(
-          (player) =>
-            Math.floor(player.x) === x && Math.floor(player.y) === y,
-        ) ||
-          [...this.units.values()].some(
-            (unit) =>
-              Math.floor(unit.x) === x && Math.floor(unit.y) === y,
-          )))
+      )
     )
       return false;
     const unitId = `u${++this.serial}`;
@@ -313,9 +285,9 @@ export class World {
       bastionType,
     });
     this.adjustUnitCount(id, "bastion", 1);
-    if (bastionType === "wall") this.wallTiles.add(tileKey);
     this.markUnit(unitId);
     p.money -= price;
+    this.creationEvents.push({ ownerId: id, kind: "building" });
     return true;
   }
   isMovementBlocked(x: number, y: number) {
@@ -390,6 +362,7 @@ export class World {
     });
     this.adjustUnitCount(ownerId, kind, 1);
     this.markUnit(unitId);
+    this.creationEvents.push({ ownerId, kind: "unit" });
   }
   tick(dt: number, now = Date.now()) {
     this.spatial.rebuild(this.players.values(), this.units.values());
@@ -651,8 +624,7 @@ export class World {
     const len = Math.hypot(x, y) || 1;
     x /= len;
     y /= len;
-    const speed =
-      GAME.player.speed * (1 + p.upgrades.speed * GAME.upgrades.speed.bonus);
+    const speed = GAME.player.speed;
     const nx = clamp(p.x + x * speed * dt, 0.1, GAME.map.width - 0.1),
       ny = clamp(p.y + y * speed * dt, 0.1, GAME.map.height - 0.1);
     if (!this.isMovementBlocked(nx, p.y)) p.x = nx;
@@ -665,9 +637,7 @@ export class World {
         p.captureSince = now;
       } else if (
         now - p.captureSince >=
-        GAME.capture.holdMs *
-          (t.owner ? GAME.capture.enemyMultiplier : 1) *
-          Math.pow(GAME.capture.improvedMultiplier, p.upgrades.capture)
+        GAME.capture.holdMs * (t.owner ? GAME.capture.enemyMultiplier : 1)
       ) {
         this.setOwner(k, t, p.id);
         p.captureKey = "";
@@ -1097,9 +1067,10 @@ export class World {
     for (const [id, count] of unsuppliedCounts)
       this.unsuppliedTerritoryCounts.set(id, count);
   }
-  setOwner(k: string, t: Tile, owner: string | null) {
+  setOwner(k: string, t: Tile, owner: string | null, record = true) {
     if (t.owner === owner) return;
     const previousOwner = t.owner;
+    if (record) this.ownershipEvents.push({ previousOwner, owner });
     if (previousOwner)
       this.territoryCounts.set(
         previousOwner,
@@ -1118,6 +1089,12 @@ export class World {
     const previousAnchor = previousOwner && this.supplyAnchors.get(previousOwner);
     if (previousAnchor && key(previousAnchor.x, previousAnchor.y) === k)
       this.relocateSupplyAnchor(previousOwner);
+  }
+  drainMatchEvents() {
+    return {
+      ownership: this.ownershipEvents.splice(0),
+      creations: this.creationEvents.splice(0),
+    };
   }
   private relocateSupplyAnchor(ownerId: string) {
     const replacement = this.safestOwnedTile(ownerId, true) ?? this.safestOwnedTile(ownerId);

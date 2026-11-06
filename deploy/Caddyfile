@@ -1,0 +1,36 @@
+{
+  email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+  encode zstd gzip
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    -Server
+  }
+  reverse_proxy client:80
+}
+
+{$API_DOMAIN} {
+  encode zstd gzip
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    -Server
+  }
+  @metrics path /metrics
+  respond @metrics 404
+  reverse_proxy server:2567
+}
+
+{$MONITOR_DOMAIN} {
+  encode zstd gzip
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    -Server
+  }
+  reverse_proxy grafana:3000
+}

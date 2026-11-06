@@ -10,17 +10,20 @@
   </head>
   <body>
     <div id="menu">
+      <canvas id="menuBattle" aria-hidden="true"></canvas>
       <div class="card">
         <div class="logo">TILE<br /><span>DOMINION</span></div>
         <p>Conquiers la grille. Construis ton armée. Garde ton royaume.</p>
         <input id="name" maxlength="16" autocomplete="username" placeholder="Nom d’utilisateur" />
         <input id="password" type="password" maxlength="128" autocomplete="current-password" placeholder="Mot de passe (8 caractères minimum)" />
+        <input id="country" maxlength="2" autocomplete="country" placeholder="Pays (FR, BE, CA…)" aria-label="Code pays à deux lettres" />
         <div class="auth-actions">
           <button id="login">SE CONNECTER</button>
           <button id="register">CRÉER UN COMPTE</button>
         </div>
         <div id="accountStatus">Mode invité — le score ne sera pas enregistré.</div>
         <button id="play">JOUER EN INVITÉ</button>
+        <div id="modeChooser"><b>MODE</b><button class="selected" type="button">DOMINATION · 15 MIN</button></div>
         <div id="globalLeaderboard"><b>CLASSEMENT GLOBAL</b><span>Chargement…</span></div>
         <small>WASD / ZQSD / flèches · Espace pour attaquer</small>
       </div>
@@ -28,7 +31,7 @@
     <div id="hud" hidden>
       <div class="stats">
         <b id="money">◈ 0</b><b id="hp">♥ 100</b><b id="tiles">▦ 0</b
-        ><b id="globalUnits">♟ 0</b><b id="time">10:00</b><i id="connection">●</i>
+        ><b id="globalUnits">♟ 0</b><b id="time">15:00</b><i id="connection">●</i>
       </div>
       <div id="leader"></div>
       <button id="shopToggle">BOUTIQUE</button>
@@ -39,20 +42,11 @@
           <button data-buy="attacker"><b>Attaquant</b><span>Verrouille et poursuit sa cible</span><em>◈140</em></button>
           <button data-buy="defender"><b>Défenseur</b><span>Garde sa zone · 210 PV · 18 dégâts</span><em>◈220</em></button>
         </div>
-        <h3>BASTIONS</h3>
-        <div class="shop-grid">
-          <button data-build="fortress"><b>Forteresse</b><span>Produit des défenseurs</span><em>◈480</em></button>
-          <button data-build="factory"><b>Usine</b><span>Produit des robots</span><em>◈480</em></button>
-          <button data-build="relay"><b>Relais</b><span>Ravitaille une enclave</span><em>◈480</em></button>
-          <button data-build="wall"><b>Mur</b><span>Bloque alliés et ennemis · 750 PV</span><em>◈90</em></button>
-          <button data-build="turret"><b>Tourelle</b><span>Tire automatiquement à portée</span><em>◈420</em></button>
-        </div>
-        <h3>AMÉLIORATIONS</h3>
-        <div class="shop-grid upgrades">
-          <button data-buy="speed"><b>Vitesse</b><em>◈110+</em></button>
-          <button data-buy="armor"><b>Armure</b><em>◈110+</em></button>
-          <button data-buy="capture"><b>Capture</b><em>◈120+</em></button>
-        </div>
+      </div>
+      <div id="buildMenu" hidden>
+        <button data-tile-build="fortress" title="Produit des défenseurs"><b>Forteresse</b><em>◈480</em></button>
+        <button data-tile-build="factory" title="Produit des robots"><b>Usine</b><em>◈480</em></button>
+        <button data-tile-build="relay" title="Étend le ravitaillement"><b>Relais</b><em>◈480</em></button>
       </div>
       <div id="orders">
         <b id="selectionCount">0 attaquant</b>
@@ -69,6 +63,39 @@
       </div>
       <div id="stick"><div></div></div>
     </div>
+    <section id="matchEnd" class="end-screen" hidden aria-labelledby="endTitle">
+      <div class="end-panel">
+        <header class="end-hero">
+          <span id="endEyebrow">PARTIE TERMINÉE</span>
+          <h1 id="endTitle">RÉSULTATS</h1>
+          <p id="endWinner"></p>
+        </header>
+        <div class="end-layout">
+          <div class="end-main">
+            <div id="endPlacement" class="placement-card"></div>
+            <div class="rank-cards">
+              <article><span>CLASSEMENT PAYS</span><strong id="countryRank">—</strong><small id="countryRankGain"></small></article>
+              <article><span>CLASSEMENT MONDE</span><strong id="worldRank">—</strong><small id="worldRankGain"></small></article>
+            </div>
+            <article class="chart-card">
+              <div><b>ÉVOLUTION DU TERRITOIRE</b><span id="territoryPeak"></span></div>
+              <canvas id="territoryChart" width="720" height="190"></canvas>
+            </article>
+            <div id="endStats" class="end-stats"></div>
+            <article class="cosmetic-card">
+              <div class="cosmetic-icon" id="cosmeticIcon">◆</div>
+              <div><span>PROGRESSION COSMÉTIQUE</span><b id="cosmeticName"></b><div class="progress-track"><i id="cosmeticProgress"></i></div><small id="cosmeticNext"></small></div>
+            </article>
+          </div>
+          <aside class="final-ranking"><b>CLASSEMENT FINAL</b><ol id="finalStandings"></ol></aside>
+        </div>
+        <footer class="end-actions">
+          <button id="replayMatch" class="primary">REJOUER</button>
+          <button id="changeMode">CHANGER DE MODE</button>
+          <button id="quitMatch">QUITTER</button>
+        </footer>
+      </div>
+    </section>
     <div id="game"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
